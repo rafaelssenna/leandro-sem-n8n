@@ -41,8 +41,8 @@ type incomingMessage struct {
 	Content        string `json:"content"`
 	Sender         string `json:"sender"`
 	SenderName     string `json:"senderName"`
-	ChatID         string `json:"chatid"`
-	ChatID2        string `json:"chatId"`
+	ChatID         string `json:"chatid"`  // lowercase
+	ChatID2        string `json:"chatId"`  // CamelCase
 	MessageID      string `json:"messageid"`
 	MessageID2     string `json:"messageId"`
 	ButtonOrListID string `json:"buttonOrListid"`
@@ -83,6 +83,9 @@ func (m *incomingMessage) norm() {
 // Chat ID format: digits@c.us | digits@s.whatsapp.net | digits@g.us | digits@newsletter
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
 
+// Fallback global: captura o primeiro JID válido em qualquer parte do JSON
+var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|newsletter))`)
+
 func extractPhoneFromJID(jid string) (string, bool) {
 	jid = strings.TrimSpace(jid)
 	m := chatIDRe.FindStringSubmatch(jid)
@@ -95,7 +98,7 @@ func extractPhoneFromJID(jid string) (string, bool) {
 // parsePayload aceita body.message, message no topo, objeto plano e variantes com key.remoteJid
 func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	defer r.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20)) // 2MB
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20)) // 4MB
 
 	// 1) body.message
 	{
@@ -164,6 +167,15 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 		}
 	}
 
+	// 6) fallback total: extrai primeiro JID que aparecer na string crua
+	{
+		var msg incomingMessage
+		if m := anyJIDRe.FindStringSubmatch(string(raw)); len(m) == 2 {
+			msg.ChatID = m[1]
+			return msg, raw, nil
+		}
+	}
+
 	return incomingMessage{}, raw, io.EOF
 }
 
@@ -198,6 +210,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		phone, ok = extractPhoneFromJID(msg.Sender)
 	}
 	if !ok {
+		// leitura rápida de key.remoteJid
 		var alt1 payloadWithKeyBody
 		if err := json.Unmarshal(raw, &alt1); err == nil && alt1.Body.Message.Key.RemoteJid != "" {
 			phone, ok = extractPhoneFromJID(alt1.Body.Message.Key.RemoteJid)
@@ -206,6 +219,12 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var alt2 payloadWithKeyTop
 			if err := json.Unmarshal(raw, &alt2); err == nil && alt2.Message.Key.RemoteJid != "" {
 				phone, ok = extractPhoneFromJID(alt2.Message.Key.RemoteJid)
+			}
+		}
+		// último fallback: regex global (já feito no parse, mas checamos aqui)
+		if !ok {
+			if m := anyJIDRe.FindStringSubmatch(string(raw)); len(m) == 2 {
+				phone, ok = extractPhoneFromJID(m[1])
 			}
 		}
 	}
@@ -267,12 +286,15 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Trace
 	log.Printf("webhook ok: phone=%s type=%s msgid=%s", phone, msgType, msg.MessageID)
 
+	// Persist inbound
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
+	// Send to Assistant
 	if err := h.ai.AddUserMessage(ctx, threadID, textForLLM); err != nil {
 		writeErr(w, http.StatusInternalServerError, "openai add message error", err)
 		return
@@ -305,6 +327,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Respond
 	if msgType == "audio" {
 		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
 		if err != nil {
