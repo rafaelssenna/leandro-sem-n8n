@@ -53,12 +53,11 @@ func (m *Manager) AddMessage(phone, text string) {
 	if n == 0 || buf.msgs[n-1] != normalized {
 		buf.msgs = append(buf.msgs, normalized)
 	}
-	if buf.timer == nil {
-		buf.timer = time.AfterFunc(m.timeout, func() { m.flush(phone) })
-	} else {
-		// debounce deslizante: sempre reinicia o timer a cada nova mensagem
-		buf.timer.Reset(m.timeout)
+	// Sempre reinicia o timer: cancela o anterior e cria um novo
+	if buf.timer != nil {
+		buf.timer.Stop()
 	}
+	buf.timer = time.AfterFunc(m.timeout, func() { m.flush(phone) })
 	buf.mu.Unlock()
 }
 
