@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -36,16 +37,16 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 // ===== Payloads tolerantes =====
 
 type incomingMessage struct {
-	MessageType    string `json:"messageType"`
-	Type           string `json:"type"`
-	Content        string `json:"content"`
-	Sender         string `json:"sender"`
-	SenderName     string `json:"senderName"`
-	ChatID         string `json:"chatid"`  // lowercase
-	ChatID2        string `json:"chatId"`  // CamelCase
-	MessageID      string `json:"messageid"`
-	MessageID2     string `json:"messageId"`
-	ButtonOrListID string `json:"buttonOrListid"`
+	MessageType    string          `json:"messageType"`
+	Type           string          `json:"type"`
+	Content        json.RawMessage `json:"content"`
+	Sender         string          `json:"sender"`
+	SenderName     string          `json:"senderName"`
+	ChatID         string          `json:"chatid"`  // lowercase
+	ChatID2        string          `json:"chatId"`  // CamelCase
+	MessageID      string          `json:"messageid"`
+	MessageID2     string          `json:"messageId"`
+	ButtonOrListID string          `json:"buttonOrListid"`
 }
 
 type payloadBody struct{ Message incomingMessage `json:"message"` }
@@ -95,10 +96,19 @@ func extractPhoneFromJID(jid string) (string, bool) {
 	return "", false
 }
 
-// parsePayload aceita body.message, message no topo, objeto plano e variantes com key.remoteJid
+// parsePayload aceita array de eventos, body.message, message no topo, objeto plano e variantes com key.remoteJid
 func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	defer r.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20)) // 4MB
+
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		// é um array de eventos, pega o primeiro elemento
+		var arr []json.RawMessage
+		if err := json.Unmarshal(trimmed, &arr); err == nil && len(arr) > 0 {
+			raw = arr[0]
+		}
+	}
 
 	// 1) body.message
 	{
@@ -262,15 +272,16 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Normalise inbound message and detect type
+	// Passa Content como json.RawMessage
 	textForLLM, msgType, err := h.normalizeInput(ctx, struct {
-		MessageType    string `json:"messageType"`
-		Type           string `json:"type"`
-		Content        string `json:"content"`
-		Sender         string `json:"sender"`
-		SenderName     string `json:"senderName"`
-		ChatID         string `json:"chatid"`
-		MessageID      string `json:"messageid"`
-		ButtonOrListID string `json:"buttonOrListid"`
+		MessageType    string          `json:"messageType"`
+		Type           string          `json:"type"`
+		Content        json.RawMessage `json:"content"`
+		Sender         string          `json:"sender"`
+		SenderName     string          `json:"senderName"`
+		ChatID         string          `json:"chatid"`
+		MessageID      string          `json:"messageid"`
+		ButtonOrListID string          `json:"buttonOrListid"`
 	}{
 		MessageType:    msg.MessageType,
 		Type:           msg.Type,
@@ -358,18 +369,19 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // normalizeInput converts incoming WhatsApp message types into a plain text string
 // suitable for the LLM and returns the derived modality.
 func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
-	MessageType    string `json:"messageType"`
-	Type           string `json:"type"`
-	Content        string `json:"content"`
-	Sender         string `json:"sender"`
-	SenderName     string `json:"senderName"`
-	ChatID         string `json:"chatid"`
-	MessageID      string `json:"messageid"`
-	ButtonOrListID string `json:"buttonOrListid"`
+	MessageType    string          `json:"messageType"`
+	Type           string          `json:"type"`
+	Content        json.RawMessage `json:"content"`
+	Sender         string          `json:"sender"`
+	SenderName     string          `json:"senderName"`
+	ChatID         string          `json:"chatid"`
+	MessageID      string          `json:"messageid"`
+	ButtonOrListID string          `json:"buttonOrListid"`
 }) (string, string, error) {
 	switch strings.ToLower(msg.MessageType) {
 	case "extendedtextmessage", "conversation":
-		content := msg.Content
+		var content string
+		_ = json.Unmarshal(msg.Content, &content)
 		if content == "" && msg.ButtonOrListID != "" {
 			content = msg.ButtonOrListID
 		}
@@ -398,7 +410,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
+		return processor.SanitizeText("Descrição da imagem: "+desc), "image", nil
 
 	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -416,10 +428,11 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 			}
 			return processor.SanitizeText(extracted), "document", nil
 		}
-		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
+		return processor.SanitizeText("Resumo do documento: "+summary), "document", nil
 
 	default:
-		content := msg.Content
+		var content string
+		_ = json.Unmarshal(msg.Content, &content)
 		if content == "" {
 			content = "(mensagem não suportada: " + msg.MessageType + ")"
 		}
