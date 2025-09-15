@@ -40,8 +40,9 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		ai:   aiClient,
 		wpp:  wppClient,
 	}
-	h.bufMgr = buffer.NewManager(15*time.Second, func(phone, combined string) {
-		go h.processCombinedMessage(context.Background(), phone, combined)
+	// Buffer de 15s (janela deslizante) — callback informa o tipo da ÚLTIMA mensagem do bloco
+	h.bufMgr = buffer.NewManager(15*time.Second, func(phone, combined, lastKind string) {
+		go h.processCombinedMessage(context.Background(), phone, combined, lastKind)
 	})
 	return h
 }
@@ -115,6 +116,7 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	trimmed := bytes.TrimSpace(raw)
 
+	// Array de eventos: usa o primeiro elemento
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var arr []json.RawMessage
 		if err := json.Unmarshal(trimmed, &arr); err == nil && len(arr) > 0 {
@@ -123,51 +125,67 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 		}
 	}
 
-	var env eventEnvelope
-	if err := json.Unmarshal(trimmed, &env); err == nil {
-		msg := env.Body.Message
-		msg.norm()
-		if msg.ChatID == "" {
-			if env.Body.Chat.WaChatID != "" {
-				msg.ChatID = env.Body.Chat.WaChatID
-			} else if env.Body.Chat.WaLastMessageSender != "" {
-				msg.ChatID = env.Body.Chat.WaLastMessageSender
+	// Envelope completo com chat + message
+	{
+		var env eventEnvelope
+		if err := json.Unmarshal(trimmed, &env); err == nil {
+			msg := env.Body.Message
+			msg.norm()
+			if msg.ChatID == "" {
+				if env.Body.Chat.WaChatID != "" {
+					msg.ChatID = env.Body.Chat.WaChatID
+				} else if env.Body.Chat.WaLastMessageSender != "" {
+					msg.ChatID = env.Body.Chat.WaLastMessageSender
+				}
+			}
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
 			}
 		}
-		if msg.ChatID != "" || msg.Sender != "" {
-			return msg, raw, nil
+	}
+
+	// body.message
+	{
+		var pr payloadRoot
+		if err := json.Unmarshal(trimmed, &pr); err == nil {
+			msg := pr.Body.Message
+			msg.norm()
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
 		}
 	}
 
-	var pr payloadRoot
-	if err := json.Unmarshal(trimmed, &pr); err == nil {
-		msg := pr.Body.Message
-		msg.norm()
-		if msg.ChatID != "" || msg.Sender != "" {
-			return msg, raw, nil
+	// message no topo
+	{
+		var pb payloadBody
+		if err := json.Unmarshal(trimmed, &pb); err == nil {
+			msg := pb.Message
+			msg.norm()
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
 		}
 	}
 
-	var pb payloadBody
-	if err := json.Unmarshal(trimmed, &pb); err == nil {
-		msg := pb.Message
-		msg.norm()
-		if msg.ChatID != "" || msg.Sender != "" {
-			return msg, raw, nil
+	// objeto plano
+	{
+		var msg incomingMessage
+		if err := json.Unmarshal(trimmed, &msg); err == nil {
+			msg.norm()
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
 		}
 	}
 
-	var msg incomingMessage
-	if err := json.Unmarshal(trimmed, &msg); err == nil {
-		msg.norm()
-		if msg.ChatID != "" || msg.Sender != "" {
+	// fallback: 1º JID que aparecer
+	{
+		var msg incomingMessage
+		if m := anyJIDRe.FindStringSubmatch(string(trimmed)); len(m) == 2 {
+			msg.ChatID = m[1]
 			return msg, raw, nil
 		}
-	}
-
-	if m := anyJIDRe.FindStringSubmatch(string(trimmed)); len(m) == 2 {
-		msg := incomingMessage{ChatID: m[1]}
-		return msg, raw, nil
 	}
 
 	return incomingMessage{}, raw, io.EOF
@@ -197,12 +215,14 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ignora eco do próprio bot
 	if msg.FromMe || msg.WasSentByAPI {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"ok":true,"ignored":"fromMe"}`))
 		return
 	}
 
+	// Extrai telefone
 	phone, ok := extractPhoneFromJID(msg.ChatID)
 	if !ok && msg.Sender != "" {
 		phone, ok = extractPhoneFromJID(msg.Sender)
@@ -217,6 +237,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upsert cliente
 	var namePtr *string
 	if msg.SenderName != "" {
 		namePtr = &msg.SenderName
@@ -227,22 +248,28 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	textForLLM, _, err := h.normalizeInput(ctx, msg)
+	// Normaliza mensagem para texto e identifica tipo (text/audio/image/document)
+	textForLLM, msgType, err := h.normalizeInput(ctx, msg)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "normalize error", err)
 		return
 	}
+	// Registra cada mensagem individual com seu tipo correto
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
-		ClientID: client.ID, Role: "user", Type: "text", Content: textForLLM, ExtID: &msg.MessageID,
+		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
-	h.bufMgr.AddMessage(phone, textForLLM)
+	// Enfileira no buffer informando o tipo da ÚLTIMA mensagem (para decidir TTS)
+	h.bufMgr.AddMessage(phone, textForLLM, msgType)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"ok":true}`))
 }
 
-func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone string, combined string) {
+// processCombinedMessage é acionado no flush do buffer.
+// lastKind indica o tipo da ÚLTIMA mensagem no bloco (se "audio", respondemos em áudio).
+func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone string, combined string, lastKind string) {
+	// Garante cliente e thread
 	client, err := models.GetOrCreateClient(ctx, h.pool, phone, nil)
 	if err != nil {
 		log.Printf("buffer db error: %v", err)
@@ -264,10 +291,10 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		threadID = tid
 	}
 
+	// Salva o combinado e envia à IA
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: "text", Content: combined,
 	})
-
 	if err := h.ai.AddUserMessage(ctx, threadID, combined); err != nil {
 		log.Println("openai add message error:", err)
 		return
@@ -300,14 +327,30 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		return
 	}
 
-	_ = models.InsertMessage(ctx, h.pool, models.Message{
-		ClientID: client.ID, Role: "assistant", Type: "text", Content: reply,
-	})
-	if err := h.wpp.SendText(ctx, phone, reply); err != nil {
-		log.Println("uazapi send text error:", err)
+	// Decide formato da resposta: áudio se a ÚLTIMA mensagem do bloco foi áudio
+	if strings.ToLower(strings.TrimSpace(lastKind)) == "audio" {
+		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
+		if err != nil {
+			log.Println("tts error:", err)
+			return
+		}
+		_ = models.InsertMessage(ctx, h.pool, models.Message{
+			ClientID: client.ID, Role: "assistant", Type: "audio", Content: reply,
+		})
+		if err := h.wpp.SendMedia(ctx, phone, "audio", audioBytes); err != nil {
+			log.Println("uazapi send audio error:", err)
+		}
+	} else {
+		_ = models.InsertMessage(ctx, h.pool, models.Message{
+			ClientID: client.ID, Role: "assistant", Type: "text", Content: reply,
+		})
+		if err := h.wpp.SendText(ctx, phone, reply); err != nil {
+			log.Println("uazapi send text error:", err)
+		}
 	}
 }
 
+// Converte uma mensagem individual em texto para o LLM e retorna o tipo.
 func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage) (string, string, error) {
 	switch strings.ToLower(msg.MessageType) {
 	case "extendedtextmessage", "conversation":
@@ -341,7 +384,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText("Descrição da imagem: "+desc), "image", nil
+		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
 
 	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -359,7 +402,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 			}
 			return processor.SanitizeText(extracted), "document", nil
 		}
-		return processor.SanitizeText("Resumo do documento: "+summary), "document", nil
+		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
 
 	default:
 		var content string
