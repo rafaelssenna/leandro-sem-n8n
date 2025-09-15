@@ -1,3 +1,4 @@
+// internal/buffer/buffer.go
 package buffer
 
 import (
@@ -6,24 +7,22 @@ import (
 	"time"
 )
 
-// Buffer armazena mensagens e um timer por usuário.
+// buffer guarda mensagens e um timer por telefone.
 type buffer struct {
 	mu    sync.Mutex
 	msgs  []string
 	timer *time.Timer
 }
 
-// Manager gerencia buffers por telefone.
+// Manager gerencia buffers por telefone e dispara o flush após timeout
+// chamando flushFunc(phone, combinedText).
 type Manager struct {
-	mu      sync.Mutex
-	buffers map[string]*buffer
-	timeout time.Duration
-	// callback a ser chamado quando o buffer expira
+	mu        sync.Mutex
+	buffers   map[string]*buffer
+	timeout   time.Duration
 	flushFunc func(phone, combined string)
 }
 
-// NewManager cria um Manager que combina mensagens após 'timeout'
-// chamando flushFunc(phone, combined).
 func NewManager(timeout time.Duration, flushFunc func(phone, combined string)) *Manager {
 	return &Manager{
 		buffers:   make(map[string]*buffer),
@@ -32,9 +31,14 @@ func NewManager(timeout time.Duration, flushFunc func(phone, combined string)) *
 	}
 }
 
-// AddMessage adiciona uma mensagem ao buffer de um telefone.
-// Se ainda não houver timer, inicia um timer para disparar flush após timeout.
+// AddMessage adiciona a mensagem ao buffer do telefone e reinicia o timer
+// (debounce deslizante). Mensagens consecutivas iguais são ignoradas.
 func (m *Manager) AddMessage(phone, text string) {
+	normalized := strings.TrimSpace(text)
+	if normalized == "" {
+		return
+	}
+
 	m.mu.Lock()
 	buf, ok := m.buffers[phone]
 	if !ok {
@@ -44,16 +48,21 @@ func (m *Manager) AddMessage(phone, text string) {
 	m.mu.Unlock()
 
 	buf.mu.Lock()
-	buf.msgs = append(buf.msgs, text)
+	// dedupe consecutivo
+	n := len(buf.msgs)
+	if n == 0 || buf.msgs[n-1] != normalized {
+		buf.msgs = append(buf.msgs, normalized)
+	}
 	if buf.timer == nil {
-		buf.timer = time.AfterFunc(m.timeout, func() {
-			m.flush(phone)
-		})
+		buf.timer = time.AfterFunc(m.timeout, func() { m.flush(phone) })
+	} else {
+		// debounce deslizante: sempre reinicia o timer a cada nova mensagem
+		buf.timer.Reset(m.timeout)
 	}
 	buf.mu.Unlock()
 }
 
-// flush é chamado quando o timer expira.
+// flush é chamado quando a janela de inatividade expira.
 func (m *Manager) flush(phone string) {
 	m.mu.Lock()
 	buf, ok := m.buffers[phone]
