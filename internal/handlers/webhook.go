@@ -40,7 +40,6 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		ai:   aiClient,
 		wpp:  wppClient,
 	}
-	// Buffer de 15s (janela deslizante)
 	h.bufMgr = buffer.NewManager(15*time.Second, func(phone, combined string) {
 		go h.processCombinedMessage(context.Background(), phone, combined)
 	})
@@ -342,7 +341,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
+		return processor.SanitizeText("Descrição da imagem: "+desc), "image", nil
 
 	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -360,7 +359,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 			}
 			return processor.SanitizeText(extracted), "document", nil
 		}
-		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
+		return processor.SanitizeText("Resumo do documento: "+summary), "document", nil
 
 	default:
 		var content string
