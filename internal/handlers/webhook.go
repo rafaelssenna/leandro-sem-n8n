@@ -39,18 +39,34 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 type incomingMessage struct {
 	MessageType    string          `json:"messageType"`
 	Type           string          `json:"type"`
-	Content        json.RawMessage `json:"content"`
+	Content        json.RawMessage `json:"content"` // pode ser string ou objeto
 	Sender         string          `json:"sender"`
 	SenderName     string          `json:"senderName"`
-	ChatID         string          `json:"chatid"`  // lowercase
-	ChatID2        string          `json:"chatId"`  // CamelCase
+	ChatID         string          `json:"chatid"`
+	ChatID2        string          `json:"chatId"`
 	MessageID      string          `json:"messageid"`
 	MessageID2     string          `json:"messageId"`
+	MessageIDAlt   string          `json:"id"` // ex.: "owner:messageid"
 	ButtonOrListID string          `json:"buttonOrListid"`
 }
 
 type payloadBody struct{ Message incomingMessage `json:"message"` }
 type payloadRoot struct{ Body payloadBody `json:"body"` }
+
+type chatInfo struct {
+	WaChatID            string `json:"wa_chatid"`
+	WaLastMessageSender string `json:"wa_lastMessageSender"`
+}
+type eventEnvelope struct {
+	Body struct {
+		BaseUrl   string          `json:"BaseUrl"`
+		EventType string          `json:"EventType"`
+		Chat      chatInfo        `json:"chat"`
+		Message   incomingMessage `json:"message"`
+		Owner     string          `json:"owner"`
+		Token     string          `json:"token"`
+	} `json:"body"`
+}
 
 // Baileys-like: key.remoteJid / key.id em message
 type keyLike struct {
@@ -79,12 +95,17 @@ func (m *incomingMessage) norm() {
 	if m.MessageID == "" && m.MessageID2 != "" {
 		m.MessageID = m.MessageID2
 	}
+	if m.MessageID == "" && m.MessageIDAlt != "" {
+		if i := strings.IndexByte(m.MessageIDAlt, ':'); i >= 0 && i+1 < len(m.MessageIDAlt) {
+			m.MessageID = m.MessageIDAlt[i+1:]
+		} else {
+			m.MessageID = m.MessageIDAlt
+		}
+	}
 }
 
-// Chat ID format: digits@c.us | digits@s.whatsapp.net | digits@g.us | digits@newsletter
+// JIDs aceitos
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
-
-// Fallback global: captura o primeiro JID válido em qualquer parte do JSON
 var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|newsletter))`)
 
 func extractPhoneFromJID(jid string) (string, bool) {
@@ -96,100 +117,79 @@ func extractPhoneFromJID(jid string) (string, bool) {
 	return "", false
 }
 
-// parsePayload aceita array de eventos, body.message, message no topo, objeto plano e variantes com key.remoteJid
+func fallbackJIDFromChat(raw []byte) (string, bool) {
+	var env eventEnvelope
+	if err := json.Unmarshal(raw, &env); err == nil {
+		if env.Body.Chat.WaChatID != "" {
+			return env.Body.Chat.WaChatID, true
+		}
+		if env.Body.Chat.WaLastMessageSender != "" {
+			return env.Body.Chat.WaLastMessageSender, true
+		}
+	}
+	return "", false
+}
+
+// parsePayload
 func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	defer r.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20)) // 4MB
-
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	trimmed := bytes.TrimSpace(raw)
+
+	// array de eventos
 	if len(trimmed) > 0 && trimmed[0] == '[' {
-		// é um array de eventos, pega o primeiro elemento
 		var arr []json.RawMessage
 		if err := json.Unmarshal(trimmed, &arr); err == nil && len(arr) > 0 {
 			raw = arr[0]
+			trimmed = bytes.TrimSpace(raw)
 		}
 	}
 
-	// 1) body.message
+	// envelope com chat+message
 	{
-		var pr payloadRoot
-		if err := json.Unmarshal(raw, &pr); err == nil {
-			msg := pr.Body.Message
+		var env eventEnvelope
+		if err := json.Unmarshal(trimmed, &env); err == nil {
+			msg := env.Body.Message
 			msg.norm()
-			if msg.ChatID != "" || msg.ChatID2 != "" || msg.Sender != "" {
-				return msg, raw, nil
-			}
-		}
-	}
-	// 2) message at the top
-	{
-		var pb payloadBody
-		if err := json.Unmarshal(raw, &pb); err == nil {
-			msg := pb.Message
-			msg.norm()
-			if msg.ChatID != "" || msg.ChatID2 != "" || msg.Sender != "" {
-				return msg, raw, nil
-			}
-		}
-	}
-	// 3) flat message
-	{
-		var msg incomingMessage
-		if err := json.Unmarshal(raw, &msg); err == nil {
-			msg.norm()
-			if msg.ChatID != "" || msg.ChatID2 != "" || msg.Sender != "" {
-				return msg, raw, nil
-			}
-		}
-	}
-	// 4) body.message.key.remoteJid / key.id
-	{
-		var alt payloadWithKeyBody
-		if err := json.Unmarshal(raw, &alt); err == nil {
-			msg := alt.Body.Message.incomingMessage
-			msg.norm()
-			if msg.ChatID == "" && alt.Body.Message.Key.RemoteJid != "" {
-				msg.ChatID = alt.Body.Message.Key.RemoteJid
-			}
-			if msg.MessageID == "" && alt.Body.Message.Key.ID != "" {
-				msg.MessageID = alt.Body.Message.Key.ID
+			if msg.ChatID == "" {
+				if env.Body.Chat.WaChatID != "" {
+					msg.ChatID = env.Body.Chat.WaChatID
+				} else if env.Body.Chat.WaLastMessageSender != "" {
+					msg.ChatID = env.Body.Chat.WaLastMessageSender
+				}
 			}
 			if msg.ChatID != "" || msg.Sender != "" {
 				return msg, raw, nil
 			}
 		}
 	}
-	// 5) message.key.remoteJid / key.id (top-level)
-	{
-		var alt payloadWithKeyTop
-		if err := json.Unmarshal(raw, &alt); err == nil {
-			msg := alt.Message.incomingMessage
-			msg.norm()
-			if msg.ChatID == "" && alt.Message.Key.RemoteJid != "" {
-				msg.ChatID = alt.Message.Key.RemoteJid
-			}
-			if msg.MessageID == "" && alt.Message.Key.ID != "" {
-				msg.MessageID = alt.Message.Key.ID
-			}
-			if msg.ChatID != "" || msg.Sender != "" {
-				return msg, raw, nil
-			}
-		}
-	}
-
-	// 6) fallback total: extrai primeiro JID que aparecer na string crua
-	{
-		var msg incomingMessage
-		if m := anyJIDRe.FindStringSubmatch(string(raw)); len(m) == 2 {
-			msg.ChatID = m[1]
+	// demais fallbacks iguais…
+	var pr payloadRoot
+	if err := json.Unmarshal(trimmed, &pr); err == nil {
+		msg := pr.Body.Message
+		msg.norm()
+		if msg.ChatID != "" || msg.Sender != "" {
 			return msg, raw, nil
 		}
 	}
-
+	var pb payloadBody
+	if err := json.Unmarshal(trimmed, &pb); err == nil {
+		msg := pb.Message
+		msg.norm()
+		if msg.ChatID != "" || msg.Sender != "" {
+			return msg, raw, nil
+		}
+	}
+	var msg incomingMessage
+	if err := json.Unmarshal(trimmed, &msg); err == nil {
+		msg.norm()
+		if msg.ChatID != "" || msg.Sender != "" {
+			return msg, raw, nil
+		}
+	}
 	return incomingMessage{}, raw, io.EOF
 }
 
-// writeErr padroniza logs + corpo da resposta
 func writeErr(w http.ResponseWriter, code int, label string, err error) {
 	if err != nil {
 		log.Printf("webhook %s: %v", label, err)
@@ -214,28 +214,19 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// === Extração robusta do telefone ===
+	// extrair telefone
 	phone, ok := extractPhoneFromJID(msg.ChatID)
 	if !ok && msg.Sender != "" {
 		phone, ok = extractPhoneFromJID(msg.Sender)
 	}
 	if !ok {
-		// leitura rápida de key.remoteJid
-		var alt1 payloadWithKeyBody
-		if err := json.Unmarshal(raw, &alt1); err == nil && alt1.Body.Message.Key.RemoteJid != "" {
-			phone, ok = extractPhoneFromJID(alt1.Body.Message.Key.RemoteJid)
+		if jid, ok2 := fallbackJIDFromChat(raw); ok2 {
+			phone, ok = extractPhoneFromJID(jid)
 		}
-		if !ok {
-			var alt2 payloadWithKeyTop
-			if err := json.Unmarshal(raw, &alt2); err == nil && alt2.Message.Key.RemoteJid != "" {
-				phone, ok = extractPhoneFromJID(alt2.Message.Key.RemoteJid)
-			}
-		}
-		// último fallback: regex global (já feito no parse, mas checamos aqui)
-		if !ok {
-			if m := anyJIDRe.FindStringSubmatch(string(raw)); len(m) == 2 {
-				phone, ok = extractPhoneFromJID(m[1])
-			}
+	}
+	if !ok {
+		if m := anyJIDRe.FindStringSubmatch(string(raw)); len(m) == 2 {
+			phone, ok = extractPhoneFromJID(m[1])
 		}
 	}
 	if !ok {
@@ -243,7 +234,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upsert client
+	// upsert client
 	var namePtr *string
 	if msg.SenderName != "" {
 		namePtr = &msg.SenderName
@@ -254,7 +245,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure thread exists
+	// garante thread
 	threadID := ""
 	if client.ThreadID != nil && *client.ThreadID != "" {
 		threadID = *client.ThreadID
@@ -271,41 +262,19 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		threadID = tid
 	}
 
-	// Normalise inbound message and detect type
-	// Passa Content como json.RawMessage
-	textForLLM, msgType, err := h.normalizeInput(ctx, struct {
-		MessageType    string          `json:"messageType"`
-		Type           string          `json:"type"`
-		Content        json.RawMessage `json:"content"`
-		Sender         string          `json:"sender"`
-		SenderName     string          `json:"senderName"`
-		ChatID         string          `json:"chatid"`
-		MessageID      string          `json:"messageid"`
-		ButtonOrListID string          `json:"buttonOrListid"`
-	}{
-		MessageType:    msg.MessageType,
-		Type:           msg.Type,
-		Content:        msg.Content,
-		Sender:         msg.Sender,
-		SenderName:     msg.SenderName,
-		ChatID:         msg.ChatID,
-		MessageID:      msg.MessageID,
-		ButtonOrListID: msg.ButtonOrListID,
-	})
+	// normaliza input
+	textForLLM, msgType, err := h.normalizeInput(ctx, msg)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "normalize error", err)
 		return
 	}
 
-	// Trace
 	log.Printf("webhook ok: phone=%s type=%s msgid=%s", phone, msgType, msg.MessageID)
 
-	// Persist inbound
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
-	// Send to Assistant
 	if err := h.ai.AddUserMessage(ctx, threadID, textForLLM); err != nil {
 		writeErr(w, http.StatusInternalServerError, "openai add message error", err)
 		return
@@ -338,7 +307,6 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Respond
 	if msgType == "audio" {
 		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
 		if err != nil {
@@ -366,18 +334,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
 
-// normalizeInput converts incoming WhatsApp message types into a plain text string
-// suitable for the LLM and returns the derived modality.
-func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
-	MessageType    string          `json:"messageType"`
-	Type           string          `json:"type"`
-	Content        json.RawMessage `json:"content"`
-	Sender         string          `json:"sender"`
-	SenderName     string          `json:"senderName"`
-	ChatID         string          `json:"chatid"`
-	MessageID      string          `json:"messageid"`
-	ButtonOrListID string          `json:"buttonOrListid"`
-}) (string, string, error) {
+func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage) (string, string, error) {
 	switch strings.ToLower(msg.MessageType) {
 	case "extendedtextmessage", "conversation":
 		var content string
@@ -410,7 +367,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText("Descrição da imagem: "+desc), "image", nil
+		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
 
 	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -428,7 +385,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 			}
 			return processor.SanitizeText(extracted), "document", nil
 		}
-		return processor.SanitizeText("Resumo do documento: "+summary), "document", nil
+		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
 
 	default:
 		var content string
