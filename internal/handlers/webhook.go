@@ -33,7 +33,7 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	return &webhookHandler{cfg: cfg, pool: pool, ai: aiClient, wpp: wppClient}
 }
 
-// ===== Tolerant payload structs =====
+// ===== Payloads tolerantes =====
 
 type incomingMessage struct {
 	MessageType    string `json:"messageType"`
@@ -41,8 +41,8 @@ type incomingMessage struct {
 	Content        string `json:"content"`
 	Sender         string `json:"sender"`
 	SenderName     string `json:"senderName"`
-	ChatID         string `json:"chatid"`  // lowercase
-	ChatID2        string `json:"chatId"`  // CamelCase
+	ChatID         string `json:"chatid"`
+	ChatID2        string `json:"chatId"`
 	MessageID      string `json:"messageid"`
 	MessageID2     string `json:"messageId"`
 	ButtonOrListID string `json:"buttonOrListid"`
@@ -50,6 +50,26 @@ type incomingMessage struct {
 
 type payloadBody struct{ Message incomingMessage `json:"message"` }
 type payloadRoot struct{ Body payloadBody `json:"body"` }
+
+// Baileys-like: key.remoteJid / key.id em message
+type keyLike struct {
+	RemoteJid string `json:"remoteJid"`
+	ID        string `json:"id"`
+}
+type payloadWithKeyBody struct {
+	Body struct {
+		Message struct {
+			Key keyLike `json:"key"`
+			incomingMessage
+		} `json:"message"`
+	} `json:"body"`
+}
+type payloadWithKeyTop struct {
+	Message struct {
+		Key keyLike `json:"key"`
+		incomingMessage
+	} `json:"message"`
+}
 
 func (m *incomingMessage) norm() {
 	if m.ChatID == "" && m.ChatID2 != "" {
@@ -60,18 +80,19 @@ func (m *incomingMessage) norm() {
 	}
 }
 
-// Chat ID format: digits@c.us or digits@s.whatsapp.net
-var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us)$`)
+// Chat ID format: digits@c.us | digits@s.whatsapp.net | digits@g.us | digits@newsletter
+var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
 
-func extractPhone(chatid string) (string, bool) {
-	m := chatIDRe.FindStringSubmatch(strings.TrimSpace(chatid))
+func extractPhoneFromJID(jid string) (string, bool) {
+	jid = strings.TrimSpace(jid)
+	m := chatIDRe.FindStringSubmatch(jid)
 	if len(m) == 2 {
 		return m[1], true
 	}
 	return "", false
 }
 
-// parsePayload accepts body.message, top-level message, or a flat object.
+// parsePayload aceita body.message, message no topo, objeto plano e variantes com key.remoteJid
 func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	defer r.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20)) // 2MB
@@ -108,11 +129,45 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 			}
 		}
 	}
+	// 4) body.message.key.remoteJid / key.id
+	{
+		var alt payloadWithKeyBody
+		if err := json.Unmarshal(raw, &alt); err == nil {
+			msg := alt.Body.Message.incomingMessage
+			msg.norm()
+			if msg.ChatID == "" && alt.Body.Message.Key.RemoteJid != "" {
+				msg.ChatID = alt.Body.Message.Key.RemoteJid
+			}
+			if msg.MessageID == "" && alt.Body.Message.Key.ID != "" {
+				msg.MessageID = alt.Body.Message.Key.ID
+			}
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
+		}
+	}
+	// 5) message.key.remoteJid / key.id (top-level)
+	{
+		var alt payloadWithKeyTop
+		if err := json.Unmarshal(raw, &alt); err == nil {
+			msg := alt.Message.incomingMessage
+			msg.norm()
+			if msg.ChatID == "" && alt.Message.Key.RemoteJid != "" {
+				msg.ChatID = alt.Message.Key.RemoteJid
+			}
+			if msg.MessageID == "" && alt.Message.Key.ID != "" {
+				msg.MessageID = alt.Message.Key.ID
+			}
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
+		}
+	}
 
 	return incomingMessage{}, raw, io.EOF
 }
 
-// writeErr pads errors with logs and readable HTTP body
+// writeErr padroniza logs + corpo da resposta
 func writeErr(w http.ResponseWriter, code int, label string, err error) {
 	if err != nil {
 		log.Printf("webhook %s: %v", label, err)
@@ -137,7 +192,23 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	phone, ok := extractPhone(msg.ChatID)
+	// === Extração robusta do telefone ===
+	phone, ok := extractPhoneFromJID(msg.ChatID)
+	if !ok && msg.Sender != "" {
+		phone, ok = extractPhoneFromJID(msg.Sender)
+	}
+	if !ok {
+		var alt1 payloadWithKeyBody
+		if err := json.Unmarshal(raw, &alt1); err == nil && alt1.Body.Message.Key.RemoteJid != "" {
+			phone, ok = extractPhoneFromJID(alt1.Body.Message.Key.RemoteJid)
+		}
+		if !ok {
+			var alt2 payloadWithKeyTop
+			if err := json.Unmarshal(raw, &alt2); err == nil && alt2.Message.Key.RemoteJid != "" {
+				phone, ok = extractPhoneFromJID(alt2.Message.Key.RemoteJid)
+			}
+		}
+	}
 	if !ok {
 		writeErr(w, http.StatusBadRequest, "invalid chatid: "+msg.ChatID, nil)
 		return
@@ -196,15 +267,12 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Trace
 	log.Printf("webhook ok: phone=%s type=%s msgid=%s", phone, msgType, msg.MessageID)
 
-	// Persist inbound
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
-	// Send to Assistant
 	if err := h.ai.AddUserMessage(ctx, threadID, textForLLM); err != nil {
 		writeErr(w, http.StatusInternalServerError, "openai add message error", err)
 		return
@@ -237,7 +305,6 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Respond
 	if msgType == "audio" {
 		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
 		if err != nil {
@@ -266,8 +333,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // normalizeInput converts incoming WhatsApp message types into a plain text string
-// suitable for the LLM and returns the derived modality. It handles text,
-// audio, image and document messages.
+// suitable for the LLM and returns the derived modality.
 func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 	MessageType    string `json:"messageType"`
 	Type           string `json:"type"`
@@ -278,8 +344,8 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 	MessageID      string `json:"messageid"`
 	ButtonOrListID string `json:"buttonOrListid"`
 }) (string, string, error) {
-	switch msg.MessageType {
-	case "ExtendedTextMessage", "Conversation":
+	switch strings.ToLower(msg.MessageType) {
+	case "extendedtextmessage", "conversation":
 		content := msg.Content
 		if content == "" && msg.ButtonOrListID != "" {
 			content = msg.ButtonOrListID
@@ -288,7 +354,8 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 			content = "(mensagem vazia)"
 		}
 		return processor.SanitizeText(content), "text", nil
-	case "AudioMessage":
+
+	case "audiomessage", "audio":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
 		if err != nil {
 			return "", "", err
@@ -298,7 +365,8 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 			return "", "", err
 		}
 		return processor.SanitizeText(t), "audio", nil
-	case "ImageMessage":
+
+	case "imagemessage", "image":
 		_, url, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
 		if err != nil {
 			return "", "", err
@@ -308,7 +376,8 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 			return "", "", err
 		}
 		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
-	case "DocumentMessage":
+
+	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
 		if err != nil {
 			return "", "", err
@@ -325,6 +394,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 			return processor.SanitizeText(extracted), "document", nil
 		}
 		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
+
 	default:
 		content := msg.Content
 		if content == "" {
