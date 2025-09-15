@@ -33,7 +33,7 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	return &webhookHandler{cfg: cfg, pool: pool, ai: aiClient, wpp: wppClient}
 }
 
-// ===== Payloads tolerantes =====
+// ===== Tolerant payload structs =====
 
 type incomingMessage struct {
 	MessageType    string `json:"messageType"`
@@ -41,19 +41,15 @@ type incomingMessage struct {
 	Content        string `json:"content"`
 	Sender         string `json:"sender"`
 	SenderName     string `json:"senderName"`
-	ChatID         string `json:"chatid"`
-	ChatID2        string `json:"chatId"`
+	ChatID         string `json:"chatid"`  // lowercase
+	ChatID2        string `json:"chatId"`  // CamelCase
 	MessageID      string `json:"messageid"`
 	MessageID2     string `json:"messageId"`
 	ButtonOrListID string `json:"buttonOrListid"`
 }
 
-type payloadBody struct {
-	Message incomingMessage `json:"message"`
-}
-type payloadRoot struct {
-	Body payloadBody `json:"body"`
-}
+type payloadBody struct{ Message incomingMessage `json:"message"` }
+type payloadRoot struct{ Body payloadBody `json:"body"` }
 
 func (m *incomingMessage) norm() {
 	if m.ChatID == "" && m.ChatID2 != "" {
@@ -64,6 +60,7 @@ func (m *incomingMessage) norm() {
 	}
 }
 
+// Chat ID format: digits@c.us or digits@s.whatsapp.net
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us)$`)
 
 func extractPhone(chatid string) (string, bool) {
@@ -74,11 +71,12 @@ func extractPhone(chatid string) (string, bool) {
 	return "", false
 }
 
+// parsePayload accepts body.message, top-level message, or a flat object.
 func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	defer r.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20)) // 2MB
 
-	// body.message
+	// 1) body.message
 	{
 		var pr payloadRoot
 		if err := json.Unmarshal(raw, &pr); err == nil {
@@ -89,7 +87,7 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 			}
 		}
 	}
-	// message no topo
+	// 2) message at the top
 	{
 		var pb payloadBody
 		if err := json.Unmarshal(raw, &pb); err == nil {
@@ -100,7 +98,7 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 			}
 		}
 	}
-	// objeto plano
+	// 3) flat message
 	{
 		var msg incomingMessage
 		if err := json.Unmarshal(raw, &msg); err == nil {
@@ -110,10 +108,11 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 			}
 		}
 	}
+
 	return incomingMessage{}, raw, io.EOF
 }
 
-// helper para padronizar logs de erro + corpo da resposta
+// writeErr pads errors with logs and readable HTTP body
 func writeErr(w http.ResponseWriter, code int, label string, err error) {
 	if err != nil {
 		log.Printf("webhook %s: %v", label, err)
@@ -144,6 +143,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upsert client
 	var namePtr *string
 	if msg.SenderName != "" {
 		namePtr = &msg.SenderName
@@ -154,6 +154,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ensure thread exists
 	threadID := ""
 	if client.ThreadID != nil && *client.ThreadID != "" {
 		threadID = *client.ThreadID
@@ -170,6 +171,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		threadID = tid
 	}
 
+	// Normalise inbound message and detect type
 	textForLLM, msgType, err := h.normalizeInput(ctx, struct {
 		MessageType    string `json:"messageType"`
 		Type           string `json:"type"`
@@ -194,17 +196,19 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Trace
 	log.Printf("webhook ok: phone=%s type=%s msgid=%s", phone, msgType, msg.MessageID)
 
+	// Persist inbound
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
+	// Send to Assistant
 	if err := h.ai.AddUserMessage(ctx, threadID, textForLLM); err != nil {
 		writeErr(w, http.StatusInternalServerError, "openai add message error", err)
 		return
 	}
-
 	runID, err := h.ai.CreateRun(ctx, threadID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "openai run error", err)
@@ -233,19 +237,24 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Respond
 	if msgType == "audio" {
 		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, "tts error", err)
 			return
 		}
-		_ = models.InsertMessage(ctx, h.pool, models.Message{ClientID: client.ID, Role: "assistant", Type: "audio", Content: reply})
+		_ = models.InsertMessage(ctx, h.pool, models.Message{
+			ClientID: client.ID, Role: "assistant", Type: "audio", Content: reply,
+		})
 		if err := h.wpp.SendMedia(ctx, phone, "audio", audioBytes); err != nil {
 			writeErr(w, http.StatusBadGateway, "uazapi send audio error", err)
 			return
 		}
 	} else {
-		_ = models.InsertMessage(ctx, h.pool, models.Message{ClientID: client.ID, Role: "assistant", Type: "text", Content: reply})
+		_ = models.InsertMessage(ctx, h.pool, models.Message{
+			ClientID: client.ID, Role: "assistant", Type: "text", Content: reply,
+		})
 		if err := h.wpp.SendText(ctx, phone, reply); err != nil {
 			writeErr(w, http.StatusBadGateway, "uazapi send text error", err)
 			return
@@ -256,6 +265,9 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
 
+// normalizeInput converts incoming WhatsApp message types into a plain text string
+// suitable for the LLM and returns the derived modality. It handles text,
+// audio, image and document messages.
 func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 	MessageType    string `json:"messageType"`
 	Type           string `json:"type"`
@@ -264,4 +276,60 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg struct {
 	SenderName     string `json:"senderName"`
 	ChatID         string `json:"chatid"`
 	MessageID      string `json:"messageid"`
-	ButtonOrListID string `
+	ButtonOrListID string `json:"buttonOrListid"`
+}) (string, string, error) {
+	switch msg.MessageType {
+	case "ExtendedTextMessage", "Conversation":
+		content := msg.Content
+		if content == "" && msg.ButtonOrListID != "" {
+			content = msg.ButtonOrListID
+		}
+		if content == "" {
+			content = "(mensagem vazia)"
+		}
+		return processor.SanitizeText(content), "text", nil
+	case "AudioMessage":
+		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
+		if err != nil {
+			return "", "", err
+		}
+		t, err := h.ai.Transcribe(ctx, data, "audio.ogg")
+		if err != nil {
+			return "", "", err
+		}
+		return processor.SanitizeText(t), "audio", nil
+	case "ImageMessage":
+		_, url, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
+		if err != nil {
+			return "", "", err
+		}
+		desc, err := h.ai.VisionDescribe(ctx, url)
+		if err != nil {
+			return "", "", err
+		}
+		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
+	case "DocumentMessage":
+		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
+		if err != nil {
+			return "", "", err
+		}
+		extracted, err := openai.ExtractPDFText(ctx, data)
+		if err != nil {
+			extracted = "(não foi possível extrair texto do PDF)"
+		}
+		summary, err := h.ai.SummarizeText(ctx, extracted)
+		if err != nil {
+			if len(extracted) > 4000 {
+				extracted = extracted[:4000]
+			}
+			return processor.SanitizeText(extracted), "document", nil
+		}
+		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
+	default:
+		content := msg.Content
+		if content == "" {
+			content = "(mensagem não suportada: " + msg.MessageType + ")"
+		}
+		return processor.SanitizeText(content), "text", nil
+	}
+}
