@@ -1,3 +1,4 @@
+// internal/handlers/webhook.go
 package handlers
 
 import (
@@ -39,7 +40,7 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		ai:   aiClient,
 		wpp:  wppClient,
 	}
-	// Buffer de 15 segundos: após isso, chama processCombinedMessage
+	// Buffer de 15s (janela deslizante)
 	h.bufMgr = buffer.NewManager(15*time.Second, func(phone, combined string) {
 		go h.processCombinedMessage(context.Background(), phone, combined)
 	})
@@ -60,6 +61,8 @@ type incomingMessage struct {
 	MessageID2     string          `json:"messageId"`
 	MessageIDAlt   string          `json:"id"`
 	ButtonOrListID string          `json:"buttonOrListid"`
+	FromMe         bool            `json:"fromMe"`
+	WasSentByAPI   bool            `json:"wasSentByApi"`
 }
 
 type payloadBody struct{ Message incomingMessage `json:"message"` }
@@ -80,13 +83,6 @@ type eventEnvelope struct {
 	} `json:"body"`
 }
 
-// Baileys-like key struct
-type keyLike struct {
-	RemoteJid string `json:"remoteJid"`
-	ID        string `json:"id"`
-}
-
-// Normaliza mensagem: junta chatId/chatId2 e messageId, e extrai messageid de "owner:messageid"
 func (m *incomingMessage) norm() {
 	if m.ChatID == "" && m.ChatID2 != "" {
 		m.ChatID = m.ChatID2
@@ -95,7 +91,7 @@ func (m *incomingMessage) norm() {
 		m.MessageID = m.MessageID2
 	}
 	if m.MessageID == "" && m.MessageIDAlt != "" {
-		if i := strings.IndexByte(m.MessageIDAlt, ':'); i >= 0 {
+		if i := strings.IndexByte(m.MessageIDAlt, ':'); i >= 0 && i+1 < len(m.MessageIDAlt) {
 			m.MessageID = m.MessageIDAlt[i+1:]
 		} else {
 			m.MessageID = m.MessageIDAlt
@@ -103,7 +99,6 @@ func (m *incomingMessage) norm() {
 	}
 }
 
-// Regexes
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
 var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|newsletter))`)
 
@@ -121,7 +116,6 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	trimmed := bytes.TrimSpace(raw)
 
-	// caso array de eventos: usa o primeiro
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var arr []json.RawMessage
 		if err := json.Unmarshal(trimmed, &arr); err == nil && len(arr) > 0 {
@@ -130,58 +124,64 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 		}
 	}
 
-	// 1) envelope com body.chat + body.message
-	{
-		var env eventEnvelope
-		if err := json.Unmarshal(trimmed, &env); err == nil {
-			msg := env.Body.Message
-			msg.norm()
-			if msg.ChatID == "" {
-				if env.Body.Chat.WaChatID != "" {
-					msg.ChatID = env.Body.Chat.WaChatID
-				} else if env.Body.Chat.WaLastMessageSender != "" {
-					msg.ChatID = env.Body.Chat.WaLastMessageSender
-				}
-			}
-			if msg.ChatID != "" || msg.Sender != "" {
-				return msg, raw, nil
+	var env eventEnvelope
+	if err := json.Unmarshal(trimmed, &env); err == nil {
+		msg := env.Body.Message
+		msg.norm()
+		if msg.ChatID == "" {
+			if env.Body.Chat.WaChatID != "" {
+				msg.ChatID = env.Body.Chat.WaChatID
+			} else if env.Body.Chat.WaLastMessageSender != "" {
+				msg.ChatID = env.Body.Chat.WaLastMessageSender
 			}
 		}
-	}
-	// 2) body.message
-	{
-		var pr payloadRoot
-		if err := json.Unmarshal(trimmed, &pr); err == nil {
-			msg := pr.Body.Message
-			msg.norm()
-			if msg.ChatID != "" || msg.Sender != "" {
-				return msg, raw, nil
-			}
-		}
-	}
-	// 3) message at top
-	{
-		var pb payloadBody
-		if err := json.Unmarshal(trimmed, &pb); err == nil {
-			msg := pb.Message
-			msg.norm()
-			if msg.ChatID != "" || msg.Sender != "" {
-				return msg, raw, nil
-			}
-		}
-	}
-	// 4) flat message
-	{
-		var msg incomingMessage
-		if err := json.Unmarshal(trimmed, &msg); err == nil {
-			msg.norm()
-			if msg.ChatID != "" || msg.Sender != "" {
-				return msg, raw, nil
-			}
+		if msg.ChatID != "" || msg.Sender != "" {
+			return msg, raw, nil
 		}
 	}
 
+	var pr payloadRoot
+	if err := json.Unmarshal(trimmed, &pr); err == nil {
+		msg := pr.Body.Message
+		msg.norm()
+		if msg.ChatID != "" || msg.Sender != "" {
+			return msg, raw, nil
+		}
+	}
+
+	var pb payloadBody
+	if err := json.Unmarshal(trimmed, &pb); err == nil {
+		msg := pb.Message
+		msg.norm()
+		if msg.ChatID != "" || msg.Sender != "" {
+			return msg, raw, nil
+		}
+	}
+
+	var msg incomingMessage
+	if err := json.Unmarshal(trimmed, &msg); err == nil {
+		msg.norm()
+		if msg.ChatID != "" || msg.Sender != "" {
+			return msg, raw, nil
+		}
+	}
+
+	if m := anyJIDRe.FindStringSubmatch(string(trimmed)); len(m) == 2 {
+		msg := incomingMessage{ChatID: m[1]}
+		return msg, raw, nil
+	}
+
 	return incomingMessage{}, raw, io.EOF
+}
+
+func writeErr(w http.ResponseWriter, code int, label string, err error) {
+	if err != nil {
+		log.Printf("webhook %s: %v", label, err)
+		http.Error(w, label+": "+err.Error(), code)
+		return
+	}
+	log.Printf("webhook %s", label)
+	http.Error(w, label, code)
 }
 
 func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -198,13 +198,17 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// extrai telefone ou fallback
+	if msg.FromMe || msg.WasSentByAPI {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true,"ignored":"fromMe"}`))
+		return
+	}
+
 	phone, ok := extractPhoneFromJID(msg.ChatID)
 	if !ok && msg.Sender != "" {
 		phone, ok = extractPhoneFromJID(msg.Sender)
 	}
 	if !ok {
-		// fallback via regex
 		if m := anyJIDRe.FindStringSubmatch(string(raw)); len(m) == 2 {
 			phone, ok = extractPhoneFromJID(m[1])
 		}
@@ -214,7 +218,6 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upsert cliente (mantém histórico no banco)
 	var namePtr *string
 	if msg.SenderName != "" {
 		namePtr = &msg.SenderName
@@ -225,34 +228,27 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// normaliza mensagem para texto (não chama a IA agora)
 	textForLLM, _, err := h.normalizeInput(ctx, msg)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "normalize error", err)
 		return
 	}
-	// armazena cada mensagem individual no histórico (role=user)
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: "text", Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
-	// adiciona ao buffer para agrupar (15 s)
 	h.bufMgr.AddMessage(phone, textForLLM)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"ok":true}`))
 }
 
-// processCombinedMessage é chamado quando o buffer de um usuário expira.
-// Ele pega as mensagens agrupadas, envia à IA e retorna 1 resposta.
 func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone string, combined string) {
-	// Upsert novamente (caso cliente não exista)
 	client, err := models.GetOrCreateClient(ctx, h.pool, phone, nil)
 	if err != nil {
 		log.Printf("buffer db error: %v", err)
 		return
 	}
-	// Recupera thread ou cria
 	threadID := ""
 	if client.ThreadID != nil && *client.ThreadID != "" {
 		threadID = *client.ThreadID
@@ -268,11 +264,11 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		}
 		threadID = tid
 	}
-	// Armazena mensagem agrupada no histórico
+
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: "text", Content: combined,
 	})
-	// Envia à IA
+
 	if err := h.ai.AddUserMessage(ctx, threadID, combined); err != nil {
 		log.Println("openai add message error:", err)
 		return
@@ -304,18 +300,15 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		log.Println("openai get message error:", err)
 		return
 	}
-	// grava resposta no histórico
+
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "assistant", Type: "text", Content: reply,
 	})
-	// envia resposta via Uazapi como texto
 	if err := h.wpp.SendText(ctx, phone, reply); err != nil {
 		log.Println("uazapi send text error:", err)
 	}
 }
 
-// normalizeInput converte uma mensagem individual em texto.
-// Para mensagens agrupadas, não usamos o tipo, apenas o texto.
 func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage) (string, string, error) {
 	switch strings.ToLower(msg.MessageType) {
 	case "extendedtextmessage", "conversation":
@@ -349,7 +342,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText("Descrição da imagem: "+desc), "image", nil
+		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
 
 	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -367,7 +360,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 			}
 			return processor.SanitizeText(extracted), "document", nil
 		}
-		return processor.SanitizeText("Resumo do documento: "+summary), "document", nil
+		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
 
 	default:
 		var content string
