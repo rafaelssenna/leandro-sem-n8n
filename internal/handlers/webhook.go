@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/your-org/leandro-agent/internal/buffer"
 	"github.com/your-org/leandro-agent/internal/config"
 	"github.com/your-org/leandro-agent/internal/models"
 	"github.com/your-org/leandro-agent/internal/openai"
@@ -20,10 +21,11 @@ import (
 )
 
 type webhookHandler struct {
-	cfg  config.Config
-	pool *pgxpool.Pool
-	ai   *openai.Client
-	wpp  *uazapi.Client
+	cfg    config.Config
+	pool   *pgxpool.Pool
+	ai     *openai.Client
+	wpp    *uazapi.Client
+	bufMgr *buffer.Manager
 }
 
 func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
@@ -31,22 +33,32 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	aiClient.TTSVoice = cfg.TTSVoice
 	aiClient.TTSSpeed = cfg.TTSSpeed
 	wppClient := uazapi.New(cfg.UazapiBaseSend, cfg.UazapiTokenSend, cfg.UazapiBaseDownload, cfg.UazapiTokenDownload)
-	return &webhookHandler{cfg: cfg, pool: pool, ai: aiClient, wpp: wppClient}
+	h := &webhookHandler{
+		cfg:  cfg,
+		pool: pool,
+		ai:   aiClient,
+		wpp:  wppClient,
+	}
+	// Buffer de 15 segundos: após isso, chama processCombinedMessage
+	h.bufMgr = buffer.NewManager(15*time.Second, func(phone, combined string) {
+		go h.processCombinedMessage(context.Background(), phone, combined)
+	})
+	return h
 }
 
-// ===== Payloads tolerantes =====
+// ===== Estruturas de payload =====
 
 type incomingMessage struct {
 	MessageType    string          `json:"messageType"`
 	Type           string          `json:"type"`
-	Content        json.RawMessage `json:"content"` // pode ser string ou objeto
+	Content        json.RawMessage `json:"content"`
 	Sender         string          `json:"sender"`
 	SenderName     string          `json:"senderName"`
 	ChatID         string          `json:"chatid"`
 	ChatID2        string          `json:"chatId"`
 	MessageID      string          `json:"messageid"`
 	MessageID2     string          `json:"messageId"`
-	MessageIDAlt   string          `json:"id"` // ex.: "owner:messageid"
+	MessageIDAlt   string          `json:"id"`
 	ButtonOrListID string          `json:"buttonOrListid"`
 }
 
@@ -68,26 +80,13 @@ type eventEnvelope struct {
 	} `json:"body"`
 }
 
-// Baileys-like: key.remoteJid / key.id em message
+// Baileys-like key struct
 type keyLike struct {
 	RemoteJid string `json:"remoteJid"`
 	ID        string `json:"id"`
 }
-type payloadWithKeyBody struct {
-	Body struct {
-		Message struct {
-			Key keyLike `json:"key"`
-			incomingMessage
-		} `json:"message"`
-	} `json:"body"`
-}
-type payloadWithKeyTop struct {
-	Message struct {
-		Key keyLike `json:"key"`
-		incomingMessage
-	} `json:"message"`
-}
 
+// Normaliza mensagem: junta chatId/chatId2 e messageId, e extrai messageid de "owner:messageid"
 func (m *incomingMessage) norm() {
 	if m.ChatID == "" && m.ChatID2 != "" {
 		m.ChatID = m.ChatID2
@@ -96,7 +95,7 @@ func (m *incomingMessage) norm() {
 		m.MessageID = m.MessageID2
 	}
 	if m.MessageID == "" && m.MessageIDAlt != "" {
-		if i := strings.IndexByte(m.MessageIDAlt, ':'); i >= 0 && i+1 < len(m.MessageIDAlt) {
+		if i := strings.IndexByte(m.MessageIDAlt, ':'); i >= 0 {
 			m.MessageID = m.MessageIDAlt[i+1:]
 		} else {
 			m.MessageID = m.MessageIDAlt
@@ -104,7 +103,7 @@ func (m *incomingMessage) norm() {
 	}
 }
 
-// JIDs aceitos
+// Regexes
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
 var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|newsletter))`)
 
@@ -117,26 +116,12 @@ func extractPhoneFromJID(jid string) (string, bool) {
 	return "", false
 }
 
-func fallbackJIDFromChat(raw []byte) (string, bool) {
-	var env eventEnvelope
-	if err := json.Unmarshal(raw, &env); err == nil {
-		if env.Body.Chat.WaChatID != "" {
-			return env.Body.Chat.WaChatID, true
-		}
-		if env.Body.Chat.WaLastMessageSender != "" {
-			return env.Body.Chat.WaLastMessageSender, true
-		}
-	}
-	return "", false
-}
-
-// parsePayload
 func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 	defer r.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	trimmed := bytes.TrimSpace(raw)
 
-	// array de eventos
+	// caso array de eventos: usa o primeiro
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var arr []json.RawMessage
 		if err := json.Unmarshal(trimmed, &arr); err == nil && len(arr) > 0 {
@@ -145,7 +130,7 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 		}
 	}
 
-	// envelope com chat+message
+	// 1) envelope com body.chat + body.message
 	{
 		var env eventEnvelope
 		if err := json.Unmarshal(trimmed, &env); err == nil {
@@ -163,41 +148,40 @@ func parsePayload(r *http.Request) (incomingMessage, []byte, error) {
 			}
 		}
 	}
-	// demais fallbacks iguais…
-	var pr payloadRoot
-	if err := json.Unmarshal(trimmed, &pr); err == nil {
-		msg := pr.Body.Message
-		msg.norm()
-		if msg.ChatID != "" || msg.Sender != "" {
-			return msg, raw, nil
+	// 2) body.message
+	{
+		var pr payloadRoot
+		if err := json.Unmarshal(trimmed, &pr); err == nil {
+			msg := pr.Body.Message
+			msg.norm()
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
 		}
 	}
-	var pb payloadBody
-	if err := json.Unmarshal(trimmed, &pb); err == nil {
-		msg := pb.Message
-		msg.norm()
-		if msg.ChatID != "" || msg.Sender != "" {
-			return msg, raw, nil
+	// 3) message at top
+	{
+		var pb payloadBody
+		if err := json.Unmarshal(trimmed, &pb); err == nil {
+			msg := pb.Message
+			msg.norm()
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
 		}
 	}
-	var msg incomingMessage
-	if err := json.Unmarshal(trimmed, &msg); err == nil {
-		msg.norm()
-		if msg.ChatID != "" || msg.Sender != "" {
-			return msg, raw, nil
+	// 4) flat message
+	{
+		var msg incomingMessage
+		if err := json.Unmarshal(trimmed, &msg); err == nil {
+			msg.norm()
+			if msg.ChatID != "" || msg.Sender != "" {
+				return msg, raw, nil
+			}
 		}
 	}
-	return incomingMessage{}, raw, io.EOF
-}
 
-func writeErr(w http.ResponseWriter, code int, label string, err error) {
-	if err != nil {
-		log.Printf("webhook %s: %v", label, err)
-		http.Error(w, label+": "+err.Error(), code)
-		return
-	}
-	log.Printf("webhook %s", label)
-	http.Error(w, label, code)
+	return incomingMessage{}, raw, io.EOF
 }
 
 func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -214,17 +198,13 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// extrair telefone
+	// extrai telefone ou fallback
 	phone, ok := extractPhoneFromJID(msg.ChatID)
 	if !ok && msg.Sender != "" {
 		phone, ok = extractPhoneFromJID(msg.Sender)
 	}
 	if !ok {
-		if jid, ok2 := fallbackJIDFromChat(raw); ok2 {
-			phone, ok = extractPhoneFromJID(jid)
-		}
-	}
-	if !ok {
+		// fallback via regex
 		if m := anyJIDRe.FindStringSubmatch(string(raw)); len(m) == 2 {
 			phone, ok = extractPhoneFromJID(m[1])
 		}
@@ -234,7 +214,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// upsert client
+	// Upsert cliente (mantém histórico no banco)
 	var namePtr *string
 	if msg.SenderName != "" {
 		namePtr = &msg.SenderName
@@ -245,43 +225,61 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// garante thread
+	// normaliza mensagem para texto (não chama a IA agora)
+	textForLLM, _, err := h.normalizeInput(ctx, msg)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "normalize error", err)
+		return
+	}
+	// armazena cada mensagem individual no histórico (role=user)
+	_ = models.InsertMessage(ctx, h.pool, models.Message{
+		ClientID: client.ID, Role: "user", Type: "text", Content: textForLLM, ExtID: &msg.MessageID,
+	})
+
+	// adiciona ao buffer para agrupar (15 s)
+	h.bufMgr.AddMessage(phone, textForLLM)
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"ok":true}`))
+}
+
+// processCombinedMessage é chamado quando o buffer de um usuário expira.
+// Ele pega as mensagens agrupadas, envia à IA e retorna 1 resposta.
+func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone string, combined string) {
+	// Upsert novamente (caso cliente não exista)
+	client, err := models.GetOrCreateClient(ctx, h.pool, phone, nil)
+	if err != nil {
+		log.Printf("buffer db error: %v", err)
+		return
+	}
+	// Recupera thread ou cria
 	threadID := ""
 	if client.ThreadID != nil && *client.ThreadID != "" {
 		threadID = *client.ThreadID
 	} else {
 		tid, err := h.ai.CreateThread(ctx)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "openai thread error", err)
+			log.Println("openai thread error:", err)
 			return
 		}
 		if err := models.SetClientThread(ctx, h.pool, client.ID, tid); err != nil {
-			writeErr(w, http.StatusInternalServerError, "db set thread error", err)
+			log.Println("db set thread error:", err)
 			return
 		}
 		threadID = tid
 	}
-
-	// normaliza input
-	textForLLM, msgType, err := h.normalizeInput(ctx, msg)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "normalize error", err)
-		return
-	}
-
-	log.Printf("webhook ok: phone=%s type=%s msgid=%s", phone, msgType, msg.MessageID)
-
+	// Armazena mensagem agrupada no histórico
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
-		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
+		ClientID: client.ID, Role: "user", Type: "text", Content: combined,
 	})
-
-	if err := h.ai.AddUserMessage(ctx, threadID, textForLLM); err != nil {
-		writeErr(w, http.StatusInternalServerError, "openai add message error", err)
+	// Envia à IA
+	if err := h.ai.AddUserMessage(ctx, threadID, combined); err != nil {
+		log.Println("openai add message error:", err)
 		return
 	}
 	runID, err := h.ai.CreateRun(ctx, threadID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "openai run error", err)
+		log.Println("openai run error:", err)
 		return
 	}
 
@@ -297,43 +295,27 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if status != "completed" {
-		writeErr(w, http.StatusBadGateway, "run not completed: "+status, nil)
+		log.Println("run not completed:", status)
 		return
 	}
 
 	reply, err := h.ai.GetLastAssistantText(ctx, threadID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "openai get message error", err)
+		log.Println("openai get message error:", err)
 		return
 	}
-
-	if msgType == "audio" {
-		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, "tts error", err)
-			return
-		}
-		_ = models.InsertMessage(ctx, h.pool, models.Message{
-			ClientID: client.ID, Role: "assistant", Type: "audio", Content: reply,
-		})
-		if err := h.wpp.SendMedia(ctx, phone, "audio", audioBytes); err != nil {
-			writeErr(w, http.StatusBadGateway, "uazapi send audio error", err)
-			return
-		}
-	} else {
-		_ = models.InsertMessage(ctx, h.pool, models.Message{
-			ClientID: client.ID, Role: "assistant", Type: "text", Content: reply,
-		})
-		if err := h.wpp.SendText(ctx, phone, reply); err != nil {
-			writeErr(w, http.StatusBadGateway, "uazapi send text error", err)
-			return
-		}
+	// grava resposta no histórico
+	_ = models.InsertMessage(ctx, h.pool, models.Message{
+		ClientID: client.ID, Role: "assistant", Type: "text", Content: reply,
+	})
+	// envia resposta via Uazapi como texto
+	if err := h.wpp.SendText(ctx, phone, reply); err != nil {
+		log.Println("uazapi send text error:", err)
 	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"ok":true}`))
 }
 
+// normalizeInput converte uma mensagem individual em texto.
+// Para mensagens agrupadas, não usamos o tipo, apenas o texto.
 func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage) (string, string, error) {
 	switch strings.ToLower(msg.MessageType) {
 	case "extendedtextmessage", "conversation":
@@ -367,7 +349,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
+		return processor.SanitizeText("Descrição da imagem: "+desc), "image", nil
 
 	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -385,7 +367,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 			}
 			return processor.SanitizeText(extracted), "document", nil
 		}
-		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
+		return processor.SanitizeText("Resumo do documento: "+summary), "document", nil
 
 	default:
 		var content string
