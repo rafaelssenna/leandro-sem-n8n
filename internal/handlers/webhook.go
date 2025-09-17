@@ -47,6 +47,13 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	return h
 }
 
+// ===== Limpeza de referências tipo 【...】 =====
+var refRe = regexp.MustCompile(`【[^】]+】`)
+
+func removeRefs(s string) string {
+	return refRe.ReplaceAllString(s, "")
+}
+
 // ===== Estruturas de payload =====
 
 type incomingMessage struct {
@@ -100,7 +107,7 @@ func (m *incomingMessage) norm() {
 }
 
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
-var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|newsletter))`)
+var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|@newsletter))`)
 
 func extractPhoneFromJID(jid string) (string, bool) {
 	jid = strings.TrimSpace(jid)
@@ -327,6 +334,9 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		return
 	}
 
+	// Limpa refs tipo 【...】 antes de salvar/enviar
+	reply = removeRefs(reply)
+
 	// Decide formato da resposta: áudio se a ÚLTIMA mensagem do bloco foi áudio
 	if strings.ToLower(strings.TrimSpace(lastKind)) == "audio" {
 		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
@@ -362,7 +372,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if content == "" {
 			content = "(mensagem vazia)"
 		}
-		return processor.SanitizeText(content), "text", nil
+		return processor.SanitizeText(removeRefs(content)), "text", nil
 
 	case "audiomessage", "audio":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -373,7 +383,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText(t), "audio", nil
+		return processor.SanitizeText(removeRefs(t)), "audio", nil
 
 	case "imagemessage", "image":
 		_, url, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -384,7 +394,7 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if err != nil {
 			return "", "", err
 		}
-		return processor.SanitizeText("Descrição da imagem: " + desc), "image", nil
+		return processor.SanitizeText(removeRefs("Descrição da imagem: " + desc)), "image", nil
 
 	case "documentmessage", "document":
 		data, _, err := h.wpp.DownloadByMessageID(ctx, msg.MessageID)
@@ -400,9 +410,9 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 			if len(extracted) > 4000 {
 				extracted = extracted[:4000]
 			}
-			return processor.SanitizeText(extracted), "document", nil
+			return processor.SanitizeText(removeRefs(extracted)), "document", nil
 		}
-		return processor.SanitizeText("Resumo do documento: " + summary), "document", nil
+		return processor.SanitizeText(removeRefs("Resumo do documento: " + summary)), "document", nil
 
 	default:
 		var content string
@@ -410,6 +420,6 @@ func (h *webhookHandler) normalizeInput(ctx context.Context, msg incomingMessage
 		if content == "" {
 			content = "(mensagem não suportada: " + msg.MessageType + ")"
 		}
-		return processor.SanitizeText(content), "text", nil
+		return processor.SanitizeText(removeRefs(content)), "text", nil
 	}
 }
