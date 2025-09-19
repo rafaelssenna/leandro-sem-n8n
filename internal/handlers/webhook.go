@@ -110,7 +110,6 @@ func (m *incomingMessage) norm() {
 }
 
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
-// corrigido: sem @ duplicado em newsletter
 var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|newsletter))`)
 
 func extractPhoneFromJID(jid string) (string, bool) {
