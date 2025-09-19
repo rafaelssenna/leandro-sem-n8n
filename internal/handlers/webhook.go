@@ -1,4 +1,3 @@
-// internal/handlers/webhook.go
 package handlers
 
 import (
@@ -34,16 +33,20 @@ func NewWebhookHandler(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	aiClient.TTSVoice = cfg.TTSVoice
 	aiClient.TTSSpeed = cfg.TTSSpeed
 	wppClient := uazapi.New(cfg.UazapiBaseSend, cfg.UazapiTokenSend, cfg.UazapiBaseDownload, cfg.UazapiTokenDownload)
+
 	h := &webhookHandler{
 		cfg:  cfg,
 		pool: pool,
 		ai:   aiClient,
 		wpp:  wppClient,
 	}
-	// Buffer de 15s (janela deslizante) — callback informa o tipo da ÚLTIMA mensagem do bloco
-	h.bufMgr = buffer.NewManager(15*time.Second, func(phone, combined, lastKind string) {
+
+	// Timeout do buffer vem do ENV (cfg.BufferTimeoutSeconds)
+	timeout := time.Duration(cfg.BufferTimeoutSeconds) * time.Second
+	h.bufMgr = buffer.NewManager(timeout, func(phone, combined, lastKind string) {
 		go h.processCombinedMessage(context.Background(), phone, combined, lastKind)
 	})
+
 	return h
 }
 
@@ -107,7 +110,8 @@ func (m *incomingMessage) norm() {
 }
 
 var chatIDRe = regexp.MustCompile(`^(\d+)(?:@s\.whatsapp\.net|@c\.us|@g\.us|@newsletter)$`)
-var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|@newsletter))`)
+// corrigido: sem @ duplicado em newsletter
+var anyJIDRe = regexp.MustCompile(`(\d+@(?:s\.whatsapp\.net|c\.us|g\.us|newsletter))`)
 
 func extractPhoneFromJID(jid string) (string, bool) {
 	jid = strings.TrimSpace(jid)
@@ -261,12 +265,27 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "normalize error", err)
 		return
 	}
-	// Registra cada mensagem individual com seu tipo correto
+
+	// Registra cada mensagem individual
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
-	// Enfileira no buffer informando o tipo da ÚLTIMA mensagem (para decidir TTS)
+	// "Digitando..." pelo tempo do buffer (não bloqueia)
+	ms := h.cfg.BufferTimeoutSeconds * 1000
+	if ms < 1000 {
+		ms = 1000
+	}
+	if ms > 60000 {
+		ms = 60000
+	}
+	go func() {
+		if err := h.wpp.SendWait(context.Background(), phone, ms); err != nil {
+			log.Println("uazapi wait error:", err)
+		}
+	}()
+
+	// Enfileira no buffer (agrupamento)
 	h.bufMgr.AddMessage(phone, textForLLM, msgType)
 
 	w.WriteHeader(http.StatusOK)
@@ -274,9 +293,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // processCombinedMessage é acionado no flush do buffer.
-// lastKind indica o tipo da ÚLTIMA mensagem no bloco (se "audio", respondemos em áudio).
 func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone string, combined string, lastKind string) {
-	// Garante cliente e thread
 	client, err := models.GetOrCreateClient(ctx, h.pool, phone, nil)
 	if err != nil {
 		log.Printf("buffer db error: %v", err)
@@ -298,7 +315,6 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		threadID = tid
 	}
 
-	// Salva o combinado e envia à IA
 	_ = models.InsertMessage(ctx, h.pool, models.Message{
 		ClientID: client.ID, Role: "user", Type: "text", Content: combined,
 	})
@@ -333,11 +349,8 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		log.Println("openai get message error:", err)
 		return
 	}
-
-	// Limpa refs tipo 【...】 antes de salvar/enviar
 	reply = removeRefs(reply)
 
-	// Decide formato da resposta: áudio se a ÚLTIMA mensagem do bloco foi áudio
 	if strings.ToLower(strings.TrimSpace(lastKind)) == "audio" {
 		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
 		if err != nil {
