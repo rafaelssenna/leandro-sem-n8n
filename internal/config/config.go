@@ -1,4 +1,3 @@
-// internal/config/config.go
 package config
 
 import (
@@ -8,8 +7,8 @@ import (
 )
 
 type Config struct {
-	Addr                  string
-	DatabaseURL           string
+	Addr        string
+	DatabaseURL string
 
 	OpenAIAPIKey          string
 	OpenAIAssistantID     string
@@ -39,21 +38,21 @@ func Load() Config {
 	cfg := Config{
 		Addr:                  getenv("APP_ADDR", ":8080"),
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
-
 		OpenAIAPIKey:          os.Getenv("OPENAI_API_KEY"),
 		OpenAIAssistantID:     os.Getenv("OPENAI_ASSISTANT_ID"),
 		OpenAIChatModel:       getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
 		OpenAITranscribeModel: getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1"),
 
-		UazapiBaseSend:        os.Getenv("UAZAPI_BASE_SEND"),
-		UazapiTokenSend:       os.Getenv("UAZAPI_TOKEN_SEND"),
-		UazapiBaseDownload:    getenv("UAZAPI_BASE_DOWNLOAD", os.Getenv("UAZAPI_BASE_SEND")),
-		UazapiTokenDownload:   getenv("UAZAPI_TOKEN_DOWNLOAD", os.Getenv("UAZAPI_TOKEN_SEND")),
+		UazapiBaseSend:     os.Getenv("UAZAPI_BASE_SEND"),
+		UazapiTokenSend:    os.Getenv("UAZAPI_TOKEN_SEND"),
+		UazapiBaseDownload: getenv("UAZAPI_BASE_DOWNLOAD", os.Getenv("UAZAPI_BASE_SEND")),
+		UazapiTokenDownload: getenv("UAZAPI_TOKEN_DOWNLOAD",
+			os.Getenv("UAZAPI_TOKEN_SEND")),
 
-		TTSVoice:              getenv("TTS_VOICE", "onyx"),
+		TTSVoice: getenv("TTS_VOICE", "onyx"),
 	}
 
-	// TTSSpeed
+	// TTS speed
 	if s := os.Getenv("TTS_SPEED"); s != "" {
 		if f, err := strconv.ParseFloat(s, 64); err == nil {
 			cfg.TTSSpeed = f
@@ -73,7 +72,7 @@ func Load() Config {
 		cfg.BufferTimeoutSeconds = 15
 	}
 
-	// Validações mínimas
+	// Guard rails
 	if cfg.DatabaseURL == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
