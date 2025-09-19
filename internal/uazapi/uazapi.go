@@ -1,121 +1,171 @@
 package uazapi
 
 import (
-    "bytes"
-    "context"
-    "encoding/base64"
-    "encoding/json"
-    "fmt"
-    "io"
-    "net/http"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 )
 
 // Client encapsulates calls to the Uazapi WhatsApp API for sending and downloading media.
 type Client struct {
-    baseSend     string
-    tokenSend    string
-    baseDownload string
-    tokenDown    string
-    http         *http.Client
+	baseSend     string
+	tokenSend    string
+	baseDownload string
+	tokenDown    string
+	http         *http.Client
 }
 
 // New creates a new Uazapi client given base URLs and tokens for sending and downloading.
 func New(baseSend, tokenSend, baseDownload, tokenDown string) *Client {
-    return &Client{
-        baseSend:     baseSend,
-        tokenSend:    tokenSend,
-        baseDownload: baseDownload,
-        tokenDown:    tokenDown,
-        http:         &http.Client{},
-    }
+	return &Client{
+		baseSend:     baseSend,
+		tokenSend:    tokenSend,
+		baseDownload: baseDownload,
+		tokenDown:    tokenDown,
+		http:         &http.Client{},
+	}
 }
+
+// ----------------- helpers -----------------
+
+func (c *Client) doJSON(ctx context.Context, url string, token string, body any) (int, []byte, error) {
+	buf, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(buf))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("token", token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, nil
+}
+
+func onlyDigits(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch >= '0' && ch <= '9' {
+			b.WriteByte(ch)
+		}
+	}
+	return b.String()
+}
+
+func makeChatID(jidOrNumber string) (number string, chatID string) {
+	if strings.Contains(jidOrNumber, "@") {
+		// já é JID
+		return onlyDigits(jidOrNumber), jidOrNumber
+	}
+	num := onlyDigits(jidOrNumber)
+	return num, num + "@s.whatsapp.net"
+}
+
+// ----------------- sending -----------------
 
 // SendText sends a plain text WhatsApp message.
 func (c *Client) SendText(ctx context.Context, number, text string) error {
-    body := map[string]any{"number": number, "text": text}
-    buf, _ := json.Marshal(body)
-    req, _ := http.NewRequestWithContext(ctx, "POST", c.baseSend+"/send/text", bytes.NewReader(buf))
-    req.Header.Set("Accept", "application/json")
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("token", c.tokenSend)
-    resp, err := c.http.Do(req)
-    if err != nil {
-        return err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode > 299 {
-        b, _ := io.ReadAll(resp.Body)
-        return fmt.Errorf("uazapi send text %d: %s", resp.StatusCode, string(b))
-    }
-    return nil
+	body := map[string]any{"number": number, "text": text}
+	code, b, err := c.doJSON(ctx, c.baseSend+"/send/text", c.tokenSend, body)
+	if err != nil {
+		return err
+	}
+	if code > 299 {
+		return fmt.Errorf("uazapi send text %d: %s", code, string(b))
+	}
+	return nil
 }
 
-// SendMedia sends a media message (e.g., audio) by base64-encoding the content. The mediaType
-// should match the type field accepted by Uazapi, e.g. "audio". The data slice is the raw
-// bytes of the media file, which will be base64-encoded automatically.
+// SendMedia sends a media message (e.g., audio) by base64-encoding the content.
 func (c *Client) SendMedia(ctx context.Context, number string, mediaType string, data []byte) error {
-    enc := base64.StdEncoding.EncodeToString(data)
-    body := map[string]any{
-        "number": number,
-        "type":   mediaType,
-        "file":   enc,
-    }
-    buf, _ := json.Marshal(body)
-    req, _ := http.NewRequestWithContext(ctx, "POST", c.baseSend+"/send/media", bytes.NewReader(buf))
-    req.Header.Set("Accept", "application/json")
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("token", c.tokenSend)
-    resp, err := c.http.Do(req)
-    if err != nil {
-        return err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode > 299 {
-        b, _ := io.ReadAll(resp.Body)
-        return fmt.Errorf("uazapi send media %d: %s", resp.StatusCode, string(b))
-    }
-    return nil
+	enc := base64.StdEncoding.EncodeToString(data)
+	body := map[string]any{
+		"number": number,
+		"type":   mediaType,
+		"file":   enc,
+	}
+	code, b, err := c.doJSON(ctx, c.baseSend+"/send/media", c.tokenSend, body)
+	if err != nil {
+		return err
+	}
+	if code > 299 {
+		return fmt.Errorf("uazapi send media %d: %s", code, string(b))
+	}
+	return nil
 }
 
-// DownloadByMessageID requests download info for a message and returns the raw bytes of the file and its URL.
-// It posts to /message/download with return_link=true, then follows the returned link.
+// DownloadByMessageID requests download info for a message and returns the raw bytes and its URL.
 func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]byte, string, error) {
-    body := map[string]any{
-        "id":          messageID,
-        "return_link": true,
-    }
-    buf, _ := json.Marshal(body)
-    req, _ := http.NewRequestWithContext(ctx, "POST", c.baseDownload+"/message/download", bytes.NewReader(buf))
-    req.Header.Set("Accept", "application/json")
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("token", c.tokenDown)
-    resp, err := c.http.Do(req)
-    if err != nil {
-        return nil, "", err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode > 299 {
-        b, _ := io.ReadAll(resp.Body)
-        return nil, "", fmt.Errorf("uazapi download %d: %s", resp.StatusCode, string(b))
-    }
-    var out struct{ FileURL string `json:"fileURL"` }
-    if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-        return nil, "", err
-    }
-    if out.FileURL == "" {
-        return nil, "", fmt.Errorf("empty fileURL")
-    }
-    // Download the media file
-    req2, _ := http.NewRequestWithContext(ctx, "GET", out.FileURL, nil)
-    resp2, err := c.http.Do(req2)
-    if err != nil {
-        return nil, out.FileURL, err
-    }
-    defer resp2.Body.Close()
-    if resp2.StatusCode > 299 {
-        b, _ := io.ReadAll(resp2.Body)
-        return nil, out.FileURL, fmt.Errorf("download media %d: %s", resp2.StatusCode, string(b))
-    }
-    data, err := io.ReadAll(resp2.Body)
-    return data, out.FileURL, err
+	body := map[string]any{"id": messageID, "return_link": true}
+	code, b, err := c.doJSON(ctx, c.baseDownload+"/message/download", c.tokenDown, body)
+	if err != nil {
+		return nil, "", err
+	}
+	if code > 299 {
+		return nil, "", fmt.Errorf("uazapi download %d: %s", code, string(b))
+	}
+	var out struct{ FileURL string `json:"fileURL"` }
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, "", err
+	}
+	if out.FileURL == "" {
+		return nil, "", fmt.Errorf("empty fileURL")
+	}
+
+	req2, _ := http.NewRequestWithContext(ctx, "GET", out.FileURL, nil)
+	resp2, err := c.http.Do(req2)
+	if err != nil {
+		return nil, out.FileURL, err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode > 299 {
+		b2, _ := io.ReadAll(resp2.Body)
+		return nil, out.FileURL, fmt.Errorf("download media %d: %s", resp2.StatusCode, string(b2))
+	}
+	data, err := io.ReadAll(resp2.Body)
+	return data, out.FileURL, err
+}
+
+// SendWait mostra o indicador "digitando..." por 'ms' milissegundos.
+// Compatível com variantes da API (tenta /wait e fallback /send/wait; envia number e chatId).
+func (c *Client) SendWait(ctx context.Context, jidOrNumber string, ms int) error {
+	if ms <= 0 {
+		return nil
+	}
+	number, chatID := makeChatID(jidOrNumber)
+
+	// Envia chaves amplas para cobrir variações da API
+	payload := map[string]any{
+		"number":   number,
+		"chatId":   chatID,
+		"chatid":   chatID,
+		"ms":       ms,
+		"time":     ms,
+		"duration": ms,
+	}
+
+	// Tentativa 1: /wait
+	if code, b, err := c.doJSON(ctx, c.baseSend+"/wait", c.tokenSend, payload); err == nil && code < 300 {
+		return nil
+	} else if err == nil && (code == 404 || code == 405) {
+		// Fallback 2: /send/wait
+		if code2, b2, err2 := c.doJSON(ctx, c.baseSend+"/send/wait", c.tokenSend, payload); err2 == nil && code2 < 300 {
+			return nil
+		} else if err2 == nil {
+			return fmt.Errorf("uazapi wait %d: %s", code2, string(b2))
+		} else {
+			return err2
+		}
+	} else if err == nil {
+		return fmt.Errorf("uazapi wait %d: %s", code, string(b))
+	} else {
+		return err
+	}
 }
