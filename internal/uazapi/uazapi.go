@@ -72,8 +72,48 @@ func makeChatID(jidOrNumber string) (number string, chatID string) {
 // ----------------- sending -----------------
 
 // SendText sends a plain text WhatsApp message.
+// Mantido por compatibilidade; agora ele usa o método novo sem delay.
 func (c *Client) SendText(ctx context.Context, number, text string) error {
-	body := map[string]any{"number": number, "text": text}
+	return c.SendTextWithDelay(ctx, number, text, 0, false)
+}
+
+// SendTextWithDelay envia texto e, se delayMs > 0, tenta exibir "digitando..."
+// e adicionar os campos de delay no próprio payload do /send/text.
+//
+// - jidOrNumber: pode ser número ou JID; ambos são aceitos.
+// - delayMs: atraso desejado em milissegundos (mostra "digitando..." esse tempo).
+// - alsoSendWait: se true, faz uma chamada separada a /wait (fallback) antes de enviar.
+//   Mesmo enviando /wait, mantemos os campos no payload para cobrir instâncias que só respeitam o delay via body.
+func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string, delayMs int, alsoSendWait bool) error {
+	number, chatID := makeChatID(jidOrNumber)
+
+	// Monta payload amplo para cobrir variações de instância:
+	body := map[string]any{
+		"number": number,
+		"text":   text,
+
+		// Algumas instâncias requerem chatId além de number
+		"chatId": chatID,
+		"chatid": chatID,
+	}
+
+	if delayMs > 0 {
+		// Opcionalmente, aciona "digitando..." via endpoint específico (se existir na instância)
+		if alsoSendWait {
+			_ = c.SendWait(ctx, jidOrNumber, delayMs) // ignoramos erro de propósito
+		}
+
+		// Muitos backends Uazapi-like entendem um ou mais destes campos:
+		body["typing"] = true
+		body["typingTime"] = delayMs   // variante comum
+		body["typing_time"] = delayMs  // outra variante
+		body["delay"] = delayMs        // alguns usam "delay"
+		body["delayMs"] = delayMs      // outros "delayMs"
+		body["time"] = delayMs         // alguns "time"
+		body["ms"] = delayMs           // alguns "ms"
+		body["duration"] = delayMs     // outros "duration"
+	}
+
 	code, b, err := c.doJSON(ctx, c.baseSend+"/send/text", c.tokenSend, body)
 	if err != nil {
 		return err
@@ -171,7 +211,7 @@ func (c *Client) SendWait(ctx context.Context, jidOrNumber string, ms int) error
 	}
 }
 
-// ----------------- NOVO: helpers de delay -----------------
+// ----------------- helpers de delay (opcionais) -----------------
 
 // WaitHumanlike aguarda a duração 'd'. Se typing=true, tenta acionar "digitando..." durante a espera.
 func (c *Client) WaitHumanlike(ctx context.Context, jidOrNumber string, d time.Duration, typing bool) {
@@ -194,9 +234,10 @@ func (c *Client) WaitHumanlike(ctx context.Context, jidOrNumber string, d time.D
 }
 
 // SendTextAfter aguarda 'd' (opcionalmente exibindo "digitando...") e então envia o texto.
+// Este método faz a espera no cliente e não depende de o backend aceitar "delay" no body.
 func (c *Client) SendTextAfter(ctx context.Context, jidOrNumber, text string, d time.Duration, typing bool) error {
 	c.WaitHumanlike(ctx, jidOrNumber, d, typing)
-	return c.SendText(ctx, onlyDigits(jidOrNumber), text)
+	return c.SendTextWithDelay(ctx, jidOrNumber, text, 0, false)
 }
 
 // SendMediaAfter aguarda 'd' (opcionalmente exibindo "digitando...") e então envia a mídia.
