@@ -18,28 +18,28 @@ import (
 /*
 Cliente Uazapi compatível com POST /send/text.
 
-Mostrar “Digitando…” de forma confiável:
-- Envia delay (ms) no /send/text (oficial).
-- (Opcional) Para delays longos, envia “pulsos” via /wait (ex.: 5500ms + 5500ms …)
-  para manter o indicador até o envio do texto.
-- Headers: token + convert:true
-- Campos extras no payload: readchat, linkPreview=false, typing flags (compat).
+- Envia "delay" (ms) no /send/text (oficial).
+- NÃO pulsa /wait automaticamente (evita 405). Só usa /wait se você habilitar WithLegacyWait(true).
+- Headers: token + convert:true.
+- Payload inclui campos de compatibilidade: readchat, linkPreview=false, replyid, mentions, typing flags.
 */
 
 type Client struct {
-	baseSend     string
-	tokenSend    string
-	baseDownload string
-	tokenDown    string
-	http         *http.Client
+	baseSend      string
+	tokenSend     string
+	baseDownload  string
+	tokenDown     string
+	http          *http.Client
+	maxRetries    int
+	backoff       time.Duration
+	logReq        bool
 
-	maxRetries     int
-	backoff        time.Duration
-	logReq         bool
-	useLegacyWait  bool   // ativa /wait antes do envio
-	waitPulseMs    int    // tamanho do pulso em ms (ex.: 5500)
-	minVisibleMs   int    // mínimo de delay para garantir visual (ex.: 1000)
-	forceTextPaths []string
+	// typing/espera (apenas se você optar)
+	useLegacyWait bool // força /wait se habilitar
+	waitPulseMs   int  // tamanho do pulso em ms (ex.: 5500)
+	minVisibleMs  int  // mínimo de delay para garantir visual (ex.: 1000)
+
+	forceTextPaths  []string
 	forceMediaPaths []string
 }
 
@@ -71,12 +71,11 @@ func (c *Client) WithLogging(enabled bool) *Client {
 	c.logReq = enabled
 	return c
 }
-// Ativa pulsos de /wait para manter “Digitando…” (recomendado quando delay > ~3–4s)
+// Usa /wait APENAS se você habilitar manualmente (evita 405).
 func (c *Client) WithLegacyWait(enabled bool) *Client {
 	c.useLegacyWait = enabled
 	return c
 }
-// Ajusta o tamanho do pulso (ms) do /wait (padrão 5500)
 func (c *Client) WithWaitPulse(ms int) *Client {
 	if ms > 0 { c.waitPulseMs = ms }
 	return c
@@ -191,9 +190,10 @@ func (c *Client) SendText(ctx context.Context, number, text string) error {
 	return c.SendTextWithDelay(ctx, number, text, 0)
 }
 
-// Envia texto com delay (ms). Para delays longos, pode enviar pulsos /wait.
+// Envia texto com delay (ms). NÃO faz /wait automático.
 func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string, delayMs int) error {
-	number, chatID := makeChatID(jidOrNumber)
+	numOnly, chatID := makeChatID(jidOrNumber)
+	number := onlyDigits(numOnly)
 
 	body := map[string]any{
 		"number":      number,
@@ -202,25 +202,25 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 		"chatid":      chatID,
 		"readchat":    true,
 		"linkPreview": false,
+		"replyid":     "",
+		"mentions":    "",
 	}
 
 	// garante um mínimo visível
 	if delayMs > 0 {
 		if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
 		body["delay"] = delayMs
-		// sinais de compat
+		// flags de compatibilidade (algumas builds checam)
 		body["typing"] = true
 		body["typingTime"] = delayMs
 		body["typing_time"] = delayMs
 		body["showTyping"] = true
 	}
 
-	// --- Pulsos /wait para manter “Digitando…” ativo em delays longos ---
+	// /wait só se você habilitar explicitamente
 	if c.useLegacyWait && delayMs > 0 {
-		if err := c.sendWaitPulsed(ctx, number, chatID, delayMs); err != nil && c.logReq {
-			fmt.Println("[uazapi] /wait pulsed error:", err)
-		}
-		// Após manter o typing com pulsos, mande o texto com delay curto (evita somar atrasos)
+		_ = c.sendWaitPulsed(ctx, number, chatID, delayMs) // erros ignorados
+		// depois de pulsar, manda delay curtinho só pra não somar mais tempo
 		body["delay"] = 300
 		body["typingTime"] = 300
 		body["typing_time"] = 300
@@ -248,7 +248,7 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 	return fmt.Errorf("uazapi send text %d: %s", lastCode, string(lastBody))
 }
 
-// Mantém “Digitando…” com pulsos /wait (ex.: 5500ms, 5500ms, …) até cobrir delayMs.
+// Mantém “Digitando…” com pulsos /wait (ex.: 5500ms, 5500ms, …) — só se habilitado.
 func (c *Client) sendWaitPulsed(ctx context.Context, number, chatID string, delayMs int) error {
 	pulse := c.waitPulseMs
 	if pulse <= 0 { pulse = 5500 }
@@ -257,7 +257,6 @@ func (c *Client) sendWaitPulsed(ctx context.Context, number, chatID string, dela
 		step := int(math.Min(float64(remaining), float64(pulse)))
 		_ = c.tryWait(ctx, number, chatID, step) // ignorar falhas
 		remaining -= step
-		// Dá um pequeno respiro entre pulsos longos
 		if remaining > 0 && step >= 2000 {
 			select {
 			case <-ctx.Done():
@@ -269,7 +268,7 @@ func (c *Client) sendWaitPulsed(ctx context.Context, number, chatID string, dela
 	return nil
 }
 
-// tenta /wait e /send/wait, mas ignora qualquer falha
+// tenta /wait e /send/wait, mas ignora qualquer falha (não loga 404/405)
 func (c *Client) tryWait(ctx context.Context, number, chatID string, ms int) error {
 	payload := map[string]any{
 		"number":   number,
@@ -279,17 +278,20 @@ func (c *Client) tryWait(ctx context.Context, number, chatID string, ms int) err
 		"time":     ms,
 		"duration": ms,
 	}
+
 	// 1) /wait
 	url := joinURL(c.baseSend, "/wait")
 	if code, _, err := c.doJSONWithRetry(ctx, url, c.tokenSend, payload); err == nil && code < 300 {
 		return nil
 	}
+
 	// 2) /send/wait
 	url2 := joinURL(c.baseSend, "/send/wait")
 	if code2, _, err2 := c.doJSONWithRetry(ctx, url2, c.tokenSend, payload); err2 == nil && code2 < 300 {
 		return nil
 	}
-	return nil
+
+	return nil // sempre silencioso
 }
 
 // ----------------- sending (MÍDIA) -----------------
@@ -317,6 +319,8 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 		"file":        enc,
 		"readchat":    true,
 		"linkPreview": false,
+		"replyid":     "",
+		"mentions":    "",
 	}
 	if delayMs > 0 {
 		if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
@@ -383,7 +387,6 @@ func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]b
 
 // ----------------- helpers “After” -----------------
 
-// Envia texto já com delay server-side (recomendado)
 func (c *Client) SendTextAfter(ctx context.Context, jidOrNumber, text string, d time.Duration, _ bool) error {
 	return c.SendTextWithDelay(ctx, jidOrNumber, text, int(d/time.Millisecond))
 }
