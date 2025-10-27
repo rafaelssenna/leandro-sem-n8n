@@ -15,15 +15,18 @@ import (
 )
 
 /*
-Cliente Uazapi (WhatsApp) com suporte robusto a "Digitando..." via campo delay.
+Cliente Uazapi compatível com POST /send/text.
 
-Diferenciais:
-- Envia delay no próprio POST /send/text (oficial).
-- Tenta múltiplos caminhos de endpoint: /send/text, /api/send/text, /send-text, /message/text, /messages/text.
-- Headers com "convert: true" (muitas instâncias exigem).
-- Campos auxiliares: readchat=true, linkPreview=false.
-- Delay mínimo de 1000ms (garante visibilidade do status).
-- HTTP resiliente (retries e backoff).
+Pontos-chave para mostrar "Digitando...":
+- Envia delay (ms) no próprio payload de /send/text.
+- Envia também campos de compatibilidade: typing=true, typingTime/typing_time=delay,
+  readchat=true, linkPreview=false (muitas instâncias exigem).
+- Header 'convert: true' além do 'token'.
+- Tenta múltiplos paths de texto (algumas instâncias expõem variantes).
+- Fallback opcional de /wait (desligado por padrão).
+
+Ative logs/espera legada se necessário:
+  client.WithLogging(true).WithLegacyWait(true)
 */
 
 type Client struct {
@@ -33,9 +36,10 @@ type Client struct {
 	tokenDown    string
 	http         *http.Client
 
-	maxRetries int
-	backoff    time.Duration
-	logReq     bool
+	maxRetries    int
+	backoff       time.Duration
+	logReq        bool
+	useLegacyWait bool
 }
 
 func New(baseSend, tokenSend, baseDownload, tokenDown string) *Client {
@@ -69,10 +73,14 @@ func (c *Client) WithLogging(enabled bool) *Client {
 	c.logReq = enabled
 	return c
 }
+func (c *Client) WithLegacyWait(enabled bool) *Client {
+	c.useLegacyWait = enabled
+	return c
+}
 
 // ----------------- helpers -----------------
 
-// tenta (base, path) seguros evitando /api//api
+// evita /api//api e garante slash único
 func joinURL(base, path string) string {
 	b := strings.TrimRight(base, "/")
 	p := path
@@ -93,7 +101,7 @@ func (c *Client) doJSONOnce(ctx context.Context, url string, token string, body 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	// MUITAS instâncias exigem estes headers:
+	// MUITAS instâncias exigem esses headers:
 	req.Header.Set("token", token)
 	req.Header.Set("convert", "true")
 
@@ -130,7 +138,7 @@ func (c *Client) doJSONWithRetry(ctx context.Context, url string, token string, 
 		if code >= 200 && code < 300 {
 			return code, b, nil
 		}
-		// 5xx → tentar de novo
+		// 5xx → retry
 		if code >= 500 && code <= 599 && try <= c.maxRetries {
 			time.Sleep(c.backoff * time.Duration(try))
 			continue
@@ -175,9 +183,9 @@ func makeChatID(jidOrNumber string) (number string, chatID string) {
 
 // ----------------- sending (TEXTO) -----------------
 
-// lista de paths prováveis (ordem por “mais comum” primeiro)
+// Algumas instâncias expõem variações; tentamos em cascata:
 var textPaths = []string{
-	"/send/text",
+	"/send/text",        // caminho oficial p/ docs (docs mostram como send~text)
 	"/api/send/text",
 	"/send-text",
 	"/api/send-text",
@@ -187,16 +195,16 @@ var textPaths = []string{
 	"/api/messages/text",
 }
 
-// SendText: compat, sem delay
+// Compat, sem delay
 func (c *Client) SendText(ctx context.Context, number, text string) error {
 	return c.SendTextWithDelay(ctx, number, text, 0)
 }
 
-// SendTextWithDelay: envia texto com suporte a "delay" (ms). Durante o delay o WhatsApp exibe “Digitando…”.
+// Envia texto com delay (ms). Durante o delay, “Digitando...” deve aparecer.
 func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string, delayMs int) error {
 	number, chatID := makeChatID(jidOrNumber)
 
-	// muitas instâncias só “mostram” se houver alguns campos padrão
+	// Campos que melhoram a compatibilidade do "typing" em diferentes builds:
 	body := map[string]any{
 		"number":      number,
 		"text":        text,
@@ -206,15 +214,25 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 		"linkPreview": false,
 	}
 
-	// impõe mínimo de 1000ms para garantir visibilidade
+	// Delay mínimo de 1000 ms ajuda a garantir visibilidade do indicador.
 	if delayMs > 0 {
 		if delayMs < 1000 {
 			delayMs = 1000
 		}
 		body["delay"] = delayMs
+		// Sinais adicionais para instâncias que checam flags:
+		body["typing"] = true
+		body["typingTime"] = delayMs
+		body["typing_time"] = delayMs
+		// algumas variantes usam 'showTyping'
+		body["showTyping"] = true
 	}
 
-	// tenta em cascata várias rotas
+	// Fallback opcional: aciona /wait antes (não falha o fluxo se der erro).
+	if c.useLegacyWait && delayMs > 0 {
+		_ = c.tryWait(ctx, number, chatID, delayMs)
+	}
+
 	var lastCode int
 	var lastBody []byte
 	var lastErr error
@@ -232,6 +250,29 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 		return lastErr
 	}
 	return fmt.Errorf("uazapi send text %d: %s", lastCode, string(lastBody))
+}
+
+// tenta /wait e /send/wait, mas ignora qualquer falha
+func (c *Client) tryWait(ctx context.Context, number, chatID string, ms int) error {
+	payload := map[string]any{
+		"number":   number,
+		"chatId":   chatID,
+		"chatid":   chatID,
+		"ms":       ms,
+		"time":     ms,
+		"duration": ms,
+	}
+	// 1) /wait
+	url := joinURL(c.baseSend, "/wait")
+	if code, _, err := c.doJSONWithRetry(ctx, url, c.tokenSend, payload); err == nil && code < 300 {
+		return nil
+	}
+	// 2) /send/wait
+	url2 := joinURL(c.baseSend, "/send/wait")
+	if code2, _, err2 := c.doJSONWithRetry(ctx, url2, c.tokenSend, payload); err2 == nil && code2 < 300 {
+		return nil
+	}
+	return nil
 }
 
 // ----------------- sending (MÍDIA) -----------------
@@ -265,6 +306,11 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 			delayMs = 1000
 		}
 		body["delay"] = delayMs
+		// compat opcional:
+		body["typing"] = true
+		body["typingTime"] = delayMs
+		body["typing_time"] = delayMs
+		body["showTyping"] = true
 	}
 
 	var lastCode int
@@ -329,9 +375,8 @@ func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]b
 
 // ----------------- helpers “After” -----------------
 
-// Espera localmente e então envia texto já com delay server-side (garante “Digitando...”).
+// Envia texto já com delay server-side (garante "Digitando..." do próprio backend).
 func (c *Client) SendTextAfter(ctx context.Context, jidOrNumber, text string, d time.Duration, _ bool) error {
-	// melhor prática: enviar o delay no próprio payload
 	delayMs := int(d / time.Millisecond)
 	return c.SendTextWithDelay(ctx, jidOrNumber, text, delayMs)
 }
