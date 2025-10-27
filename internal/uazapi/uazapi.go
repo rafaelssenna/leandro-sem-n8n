@@ -222,4 +222,78 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 	return nil
 }
 
-// -----------
+// ----------------- download -----------------
+
+// DownloadByMessageID baixa o conteúdo de uma mensagem via ID.
+func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]byte, string, error) {
+	body := map[string]any{
+		"id":          messageID,
+		"return_link": true,
+	}
+
+	code, b, err := c.doJSON(ctx, c.baseDownload+"/message/download", c.tokenDown, body)
+	if err != nil {
+		return nil, "", err
+	}
+	if code > 299 {
+		return nil, "", fmt.Errorf("uazapi download %d: %s", code, string(b))
+	}
+
+	var out struct {
+		FileURL string `json:"fileURL"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, "", err
+	}
+	if out.FileURL == "" {
+		return nil, "", fmt.Errorf("empty fileURL")
+	}
+
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, out.FileURL, nil)
+	resp2, err := c.http.Do(req2)
+	if err != nil {
+		return nil, out.FileURL, err
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode > 299 {
+		b2, _ := io.ReadAll(resp2.Body)
+		return nil, out.FileURL, fmt.Errorf("download media %d: %s", resp2.StatusCode, string(b2))
+	}
+
+	data, err := io.ReadAll(resp2.Body)
+	return data, out.FileURL, err
+}
+
+// ----------------- helpers “After” -----------------
+
+// WaitHumanlike aguarda a duração 'd'. Se typing=true, use a própria API com delay no envio real.
+// (Mantido por compatibilidade; prefira chamar diretamente SendTextWithDelay com o delay desejado.)
+func (c *Client) WaitHumanlike(ctx context.Context, _ string, d time.Duration, _ bool) {
+	if d <= 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+// SendTextAfter agenda um envio de texto com atraso local (utilize delay no payload quando possível).
+func (c *Client) SendTextAfter(ctx context.Context, jidOrNumber, text string, d time.Duration, _ bool) error {
+	if d > 0 {
+		c.WaitHumanlike(ctx, jidOrNumber, d, false)
+	}
+	// Melhor abordagem: enviar já com delay (server-side typing)
+	return c.SendTextWithDelay(ctx, jidOrNumber, text, int(d.Milliseconds()))
+}
+
+// SendMediaAfter agenda um envio de mídia com atraso local.
+func (c *Client) SendMediaAfter(ctx context.Context, jidOrNumber string, mediaType string, data []byte, d time.Duration, _ bool) error {
+	if d > 0 {
+		c.WaitHumanlike(ctx, jidOrNumber, d, false)
+	}
+	return c.SendMediaWithDelay(ctx, onlyDigits(jidOrNumber), mediaType, data, int(d.Milliseconds()))
+}
