@@ -187,7 +187,7 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 			}
 		}
 	} else {
-		// payload “compatível” (se você quiser manter flags)
+		// payload “compatível”
 		body = map[string]any{
 			"number":      number,
 			"text":        text,
