@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Client encapsulates calls to the Uazapi WhatsApp API for sending and downloading media.
@@ -168,4 +169,38 @@ func (c *Client) SendWait(ctx context.Context, jidOrNumber string, ms int) error
 	} else {
 		return err
 	}
+}
+
+// ----------------- NOVO: helpers de delay -----------------
+
+// WaitHumanlike aguarda a duração 'd'. Se typing=true, tenta acionar "digitando..." durante a espera.
+func (c *Client) WaitHumanlike(ctx context.Context, jidOrNumber string, d time.Duration, typing bool) {
+	ms := int(d / time.Millisecond)
+	if ms <= 0 {
+		return
+	}
+	if typing {
+		// Ignora erro propositalmente para não quebrar o fluxo se o endpoint não existir.
+		_ = c.SendWait(ctx, jidOrNumber, ms)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		return
+	}
+}
+
+// SendTextAfter aguarda 'd' (opcionalmente exibindo "digitando...") e então envia o texto.
+func (c *Client) SendTextAfter(ctx context.Context, jidOrNumber, text string, d time.Duration, typing bool) error {
+	c.WaitHumanlike(ctx, jidOrNumber, d, typing)
+	return c.SendText(ctx, onlyDigits(jidOrNumber), text)
+}
+
+// SendMediaAfter aguarda 'd' (opcionalmente exibindo "digitando...") e então envia a mídia.
+func (c *Client) SendMediaAfter(ctx context.Context, jidOrNumber string, mediaType string, data []byte, d time.Duration, typing bool) error {
+	c.WaitHumanlike(ctx, jidOrNumber, d, typing)
+	return c.SendMedia(ctx, onlyDigits(jidOrNumber), mediaType, data)
 }
