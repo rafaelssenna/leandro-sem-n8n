@@ -8,9 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,82 +18,93 @@ import (
 /*
 Cliente Uazapi compatível com POST /send/text.
 
-- Envia "delay" (ms) no /send/text (oficial).
-- NÃO pulsa /wait automaticamente (evita 405). Só usa /wait se você habilitar WithLegacyWait(true).
+- NÃO usa /wait.
+- Suporta payload mínimo exatamente como seu exemplo:
+    { "number": "...", "text": "...", "delay": "1000" }
+  via WithMinimalPayload(true) + WithDelayAsString(true).
+- Caso não use o modo mínimo, envia payload completo de compatibilidade.
 - Headers: token + convert:true.
-- Payload inclui campos de compatibilidade: readchat, linkPreview=false, replyid, mentions, typing flags.
 */
 
 type Client struct {
-	baseSend      string
-	tokenSend     string
-	baseDownload  string
-	tokenDown     string
-	http          *http.Client
-	maxRetries    int
-	backoff       time.Duration
-	logReq        bool
+	baseSend     string
+	tokenSend    string
+	baseDownload string
+	tokenDown    string
+	http         *http.Client
 
-	// typing/espera (apenas se você optar)
-	useLegacyWait bool // força /wait se habilitar
-	waitPulseMs   int  // tamanho do pulso em ms (ex.: 5500)
-	minVisibleMs  int  // mínimo de delay para garantir visual (ex.: 1000)
+	maxRetries     int
+	backoff        time.Duration
+	logReq         bool
+	minVisibleMs   int // força delay mínimo visível
 
-	forceTextPaths  []string
-	forceMediaPaths []string
+	// controles de payload
+	minimalPayload bool // se true, envia só number/text/delay
+	delayAsString  bool // se true, envia delay como string
 }
 
 func New(baseSend, tokenSend, baseDownload, tokenDown string) *Client {
 	return &Client{
-		baseSend:      strings.TrimRight(baseSend, "/"),
-		tokenSend:     tokenSend,
-		baseDownload:  strings.TrimRight(baseDownload, "/"),
-		tokenDown:     tokenDown,
-		http:          &http.Client{Timeout: 30 * time.Second},
-		maxRetries:    3,
-		backoff:       250 * time.Millisecond,
-		useLegacyWait: false,
-		waitPulseMs:   5500,
-		minVisibleMs:  1000,
+		baseSend:     strings.TrimRight(baseSend, "/"),
+		tokenSend:    tokenSend,
+		baseDownload: strings.TrimRight(baseDownload, "/"),
+		tokenDown:    tokenDown,
+		http:         &http.Client{Timeout: 30 * time.Second},
+		maxRetries:   3,
+		backoff:      250 * time.Millisecond,
+		minVisibleMs: 1000,
 	}
 }
 
 func (c *Client) WithHTTPClient(h *http.Client) *Client {
-	if h != nil { c.http = h }
+	if h != nil {
+		c.http = h
+	}
 	return c
 }
 func (c *Client) WithRetry(maxRetries int, backoff time.Duration) *Client {
-	if maxRetries >= 0 { c.maxRetries = maxRetries }
-	if backoff > 0 { c.backoff = backoff }
+	if maxRetries >= 0 {
+		c.maxRetries = maxRetries
+	}
+	if backoff > 0 {
+		c.backoff = backoff
+	}
 	return c
 }
 func (c *Client) WithLogging(enabled bool) *Client {
 	c.logReq = enabled
 	return c
 }
-// Usa /wait APENAS se você habilitar manualmente (evita 405).
-func (c *Client) WithLegacyWait(enabled bool) *Client {
-	c.useLegacyWait = enabled
-	return c
-}
-func (c *Client) WithWaitPulse(ms int) *Client {
-	if ms > 0 { c.waitPulseMs = ms }
-	return c
-}
 func (c *Client) WithMinVisibleDelay(ms int) *Client {
-	if ms > 0 { c.minVisibleMs = ms }
+	if ms > 0 {
+		c.minVisibleMs = ms
+	}
 	return c
 }
 
-// ----------------- helpers -----------------
+// ---- novos toggles para bater no formato exato do seu payload ----
+func (c *Client) WithMinimalPayload(enabled bool) *Client {
+	c.minimalPayload = enabled
+	return c
+}
+func (c *Client) WithDelayAsString(enabled bool) *Client {
+	c.delayAsString = enabled
+	return c
+}
+
+// ----------------- helpers HTTP -----------------
 
 func joinURL(base, path string) string {
 	b := strings.TrimRight(base, "/")
 	p := path
-	if !strings.HasPrefix(p, "/") { p = "/" + p }
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
 	if strings.HasSuffix(b, "/api") && strings.HasPrefix(p, "/api/") {
 		p = strings.TrimPrefix(p, "/api")
-		if !strings.HasPrefix(p, "/") { p = "/" + p }
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
 	}
 	return b + p
 }
@@ -135,7 +146,9 @@ func (c *Client) doJSONWithRetry(ctx context.Context, url string, token string, 
 			return 0, nil, err
 		}
 		lastCode, lastBody = code, b
-		if code >= 200 && code < 300 { return code, b, nil }
+		if code >= 200 && code < 300 {
+			return code, b, nil
+		}
 		if code >= 500 && code <= 599 && try <= c.maxRetries {
 			time.Sleep(c.backoff * time.Duration(try))
 			continue
@@ -145,9 +158,13 @@ func (c *Client) doJSONWithRetry(ctx context.Context, url string, token string, 
 }
 
 func isRetryableNetErr(err error) bool {
-	if err == nil { return false }
+	if err == nil {
+		return false
+	}
 	var nerr net.Error
-	if errors.As(err, &nerr) { return nerr.Timeout() || nerr.Temporary() }
+	if errors.As(err, &nerr) {
+		return nerr.Timeout() || nerr.Temporary()
+	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "connection reset") ||
 		strings.Contains(s, "connection refused") ||
@@ -159,7 +176,9 @@ func onlyDigits(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
-		if ch >= '0' && ch <= '9' { b.WriteByte(ch) }
+		if ch >= '0' && ch <= '9' {
+			b.WriteByte(ch)
+		}
 	}
 	return b.String()
 }
@@ -174,8 +193,8 @@ func makeChatID(jidOrNumber string) (number string, chatID string) {
 
 // ----------------- sending (TEXTO) -----------------
 
-var defaultTextPaths = []string{
-	"/send/text",        // docs mostram 'send~text', mas o caminho HTTP real é /send/text
+var textPaths = []string{
+	"/send/text", // docs mostram 'send~text', o caminho real é /send/text
 	"/api/send/text",
 	"/send-text",
 	"/api/send-text",
@@ -185,55 +204,60 @@ var defaultTextPaths = []string{
 	"/api/messages/text",
 }
 
-// Compat: envia sem delay
+// Compat: sem delay
 func (c *Client) SendText(ctx context.Context, number, text string) error {
 	return c.SendTextWithDelay(ctx, number, text, 0)
 }
 
-// Envia texto com delay (ms). NÃO faz /wait automático.
+// Envia texto com delay (ms). NÃO chama /wait.
+// Se minimalPayload=true, envia APENAS number/text/delay (delay em string se delayAsString=true).
 func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string, delayMs int) error {
-	numOnly, chatID := makeChatID(jidOrNumber)
+	numOnly, _ := makeChatID(jidOrNumber)
 	number := onlyDigits(numOnly)
 
-	body := map[string]any{
-		"number":      number,
-		"text":        text,
-		"chatId":      chatID,
-		"chatid":      chatID,
-		"readchat":    true,
-		"linkPreview": false,
-		"replyid":     "",
-		"mentions":    "",
-	}
+	var body map[string]any
 
-	// garante um mínimo visível
-	if delayMs > 0 {
-		if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
-		body["delay"] = delayMs
-		// flags de compatibilidade (algumas builds checam)
-		body["typing"] = true
-		body["typingTime"] = delayMs
-		body["typing_time"] = delayMs
-		body["showTyping"] = true
+	if c.minimalPayload {
+		body = map[string]any{
+			"number": number,
+			"text":   text,
+		}
+		if delayMs > 0 {
+			if delayMs < c.minVisibleMs {
+				delayMs = c.minVisibleMs
+			}
+			if c.delayAsString {
+				body["delay"] = strconv.Itoa(delayMs) // "1000"
+			} else {
+				body["delay"] = delayMs // 1000
+			}
+		}
+	} else {
+		// payload completo de compat
+		body = map[string]any{
+			"number":      number,
+			"text":        text,
+			"readchat":    true,
+			"linkPreview": false,
+			"replyid":     "",
+			"mentions":    "",
+		}
+		if delayMs > 0 {
+			if delayMs < c.minVisibleMs {
+				delayMs = c.minVisibleMs
+			}
+			body["delay"] = delayMs
+			body["typing"] = true
+			body["typingTime"] = delayMs
+			body["typing_time"] = delayMs
+			body["showTyping"] = true
+		}
 	}
-
-	// /wait só se você habilitar explicitamente
-	if c.useLegacyWait && delayMs > 0 {
-		_ = c.sendWaitPulsed(ctx, number, chatID, delayMs) // erros ignorados
-		// depois de pulsar, manda delay curtinho só pra não somar mais tempo
-		body["delay"] = 300
-		body["typingTime"] = 300
-		body["typing_time"] = 300
-	}
-
-	paths := c.forceTextPaths
-	if len(paths) == 0 { paths = defaultTextPaths }
 
 	var lastCode int
 	var lastBody []byte
 	var lastErr error
-
-	for _, p := range paths {
+	for _, p := range textPaths {
 		url := joinURL(c.baseSend, p)
 		code, b, err := c.doJSONWithRetry(ctx, url, c.tokenSend, body)
 		if err == nil && code >= 200 && code < 300 {
@@ -241,62 +265,15 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 		}
 		lastCode, lastBody, lastErr = code, b, err
 	}
-
 	if lastErr != nil {
 		return lastErr
 	}
 	return fmt.Errorf("uazapi send text %d: %s", lastCode, string(lastBody))
 }
 
-// Mantém “Digitando…” com pulsos /wait (ex.: 5500ms, 5500ms, …) — só se habilitado.
-func (c *Client) sendWaitPulsed(ctx context.Context, number, chatID string, delayMs int) error {
-	pulse := c.waitPulseMs
-	if pulse <= 0 { pulse = 5500 }
-	remaining := delayMs
-	for remaining > 0 {
-		step := int(math.Min(float64(remaining), float64(pulse)))
-		_ = c.tryWait(ctx, number, chatID, step) // ignorar falhas
-		remaining -= step
-		if remaining > 0 && step >= 2000 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-	}
-	return nil
-}
-
-// tenta /wait e /send/wait, mas ignora qualquer falha (não loga 404/405)
-func (c *Client) tryWait(ctx context.Context, number, chatID string, ms int) error {
-	payload := map[string]any{
-		"number":   number,
-		"chatId":   chatID,
-		"chatid":   chatID,
-		"ms":       ms,
-		"time":     ms,
-		"duration": ms,
-	}
-
-	// 1) /wait
-	url := joinURL(c.baseSend, "/wait")
-	if code, _, err := c.doJSONWithRetry(ctx, url, c.tokenSend, payload); err == nil && code < 300 {
-		return nil
-	}
-
-	// 2) /send/wait
-	url2 := joinURL(c.baseSend, "/send/wait")
-	if code2, _, err2 := c.doJSONWithRetry(ctx, url2, c.tokenSend, payload); err2 == nil && code2 < 300 {
-		return nil
-	}
-
-	return nil // sempre silencioso
-}
-
 // ----------------- sending (MÍDIA) -----------------
 
-var defaultMediaPaths = []string{
+var mediaPaths = []string{
 	"/send/media",
 	"/api/send/media",
 	"/send-media",
@@ -310,7 +287,6 @@ var defaultMediaPaths = []string{
 func (c *Client) SendMedia(ctx context.Context, number string, mediaType string, data []byte) error {
 	return c.SendMediaWithDelay(ctx, number, mediaType, data, 0)
 }
-
 func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaType string, data []byte, delayMs int) error {
 	enc := base64.StdEncoding.EncodeToString(data)
 	body := map[string]any{
@@ -323,7 +299,9 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 		"mentions":    "",
 	}
 	if delayMs > 0 {
-		if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
+		if delayMs < c.minVisibleMs {
+			delayMs = c.minVisibleMs
+		}
 		body["delay"] = delayMs
 		body["typing"] = true
 		body["typingTime"] = delayMs
@@ -331,13 +309,10 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 		body["showTyping"] = true
 	}
 
-	paths := c.forceMediaPaths
-	if len(paths) == 0 { paths = defaultMediaPaths }
-
 	var lastCode int
 	var lastBody []byte
 	var lastErr error
-	for _, p := range paths {
+	for _, p := range mediaPaths {
 		url := joinURL(c.baseSend, p)
 		code, b, err := c.doJSONWithRetry(ctx, url, c.tokenSend, body)
 		if err == nil && code >= 200 && code < 300 {
@@ -369,12 +344,18 @@ func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]b
 	}
 
 	var out struct{ FileURL string `json:"fileURL"` }
-	if err := json.Unmarshal(b, &out); err != nil { return nil, "", err }
-	if out.FileURL == "" { return nil, "", fmt.Errorf("empty fileURL") }
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, "", err
+	}
+	if out.FileURL == "" {
+		return nil, "", fmt.Errorf("empty fileURL")
+	}
 
 	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, out.FileURL, nil)
 	resp2, err := c.http.Do(req2)
-	if err != nil { return nil, out.FileURL, err }
+	if err != nil {
+		return nil, out.FileURL, err
+	}
 	defer resp2.Body.Close()
 
 	if resp2.StatusCode > 299 {
