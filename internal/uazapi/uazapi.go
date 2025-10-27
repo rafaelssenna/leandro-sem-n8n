@@ -15,19 +15,17 @@ import (
 )
 
 /*
-Pacote de cliente para Uazapi (WhatsApp).
+Cliente Uazapi (WhatsApp) com suporte robusto a "Digitando..." via campo delay.
 
-Principais pontos:
-- /send/text aceita o campo "delay" (ms) para exibir "Digitando..." antes do envio.
-- Mantidas assinaturas compatíveis:
-    - SendText(ctx, number, text)                  → envia sem delay
-    - SendTextWithDelay(ctx, jidOrNumber, text, delayMs)
-- Mídia: SendMediaWithDelay adiciona "delay" se a sua instância suportar no /send/media.
-- DownloadByMessageID: baixa mídia via fileURL retornada pelo /message/download.
-- HTTP resiliente: até 3 tentativas em falhas transitórias (5xx/timeout/reset).
+Diferenciais:
+- Envia delay no próprio POST /send/text (oficial).
+- Tenta múltiplos caminhos de endpoint: /send/text, /api/send/text, /send-text, /message/text, /messages/text.
+- Headers com "convert: true" (muitas instâncias exigem).
+- Campos auxiliares: readchat=true, linkPreview=false.
+- Delay mínimo de 1000ms (garante visibilidade do status).
+- HTTP resiliente (retries e backoff).
 */
 
-// Client encapsula chamadas à API Uazapi para envio e download de mídia.
 type Client struct {
 	baseSend     string
 	tokenSend    string
@@ -35,17 +33,16 @@ type Client struct {
 	tokenDown    string
 	http         *http.Client
 
-	// Opções de resiliência
 	maxRetries int
 	backoff    time.Duration
+	logReq     bool
 }
 
-// New cria um novo cliente Uazapi com URLs base e tokens para envio e download.
 func New(baseSend, tokenSend, baseDownload, tokenDown string) *Client {
 	return &Client{
-		baseSend:     baseSend,
+		baseSend:     strings.TrimRight(baseSend, "/"),
 		tokenSend:    tokenSend,
-		baseDownload: baseDownload,
+		baseDownload: strings.TrimRight(baseDownload, "/"),
 		tokenDown:    tokenDown,
 		http:         &http.Client{Timeout: 30 * time.Second},
 		maxRetries:   3,
@@ -53,15 +50,12 @@ func New(baseSend, tokenSend, baseDownload, tokenDown string) *Client {
 	}
 }
 
-// WithHTTPClient permite injetar um http.Client customizado.
 func (c *Client) WithHTTPClient(h *http.Client) *Client {
 	if h != nil {
 		c.http = h
 	}
 	return c
 }
-
-// WithRetry ajusta tentativas e backoff.
 func (c *Client) WithRetry(maxRetries int, backoff time.Duration) *Client {
 	if maxRetries >= 0 {
 		c.maxRetries = maxRetries
@@ -71,25 +65,58 @@ func (c *Client) WithRetry(maxRetries int, backoff time.Duration) *Client {
 	}
 	return c
 }
+func (c *Client) WithLogging(enabled bool) *Client {
+	c.logReq = enabled
+	return c
+}
 
 // ----------------- helpers -----------------
 
-func (c *Client) doJSON(ctx context.Context, url string, token string, body any) (int, []byte, error) {
-	buf, _ := json.Marshal(body)
+// tenta (base, path) seguros evitando /api//api
+func joinURL(base, path string) string {
+	b := strings.TrimRight(base, "/")
+	p := path
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if strings.HasSuffix(b, "/api") && strings.HasPrefix(p, "/api/") {
+		p = strings.TrimPrefix(p, "/api")
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+	}
+	return b + p
+}
 
+func (c *Client) doJSONOnce(ctx context.Context, url string, token string, body any) (int, []byte, error) {
+	buf, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	// MUITAS instâncias exigem estes headers:
+	req.Header.Set("token", token)
+	req.Header.Set("convert", "true")
+
+	if c.logReq {
+		fmt.Printf("[uazapi] POST %s\n", url)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, nil
+}
+
+func (c *Client) doJSONWithRetry(ctx context.Context, url string, token string, body any) (int, []byte, error) {
 	var lastCode int
 	var lastBody []byte
 	var lastErr error
 
-	try := 0
-	for {
-		try++
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("token", token)
-
-		resp, err := c.http.Do(req)
+	for try := 1; ; try++ {
+		code, b, err := c.doJSONOnce(ctx, url, token, body)
 		if err != nil {
 			lastErr = err
 			if try <= c.maxRetries && isRetryableNetErr(err) {
@@ -98,26 +125,17 @@ func (c *Client) doJSON(ctx context.Context, url string, token string, body any)
 			}
 			return 0, nil, err
 		}
+		lastCode, lastBody = code, b
 
-		func() {
-			defer resp.Body.Close()
-			b, _ := io.ReadAll(resp.Body)
-			lastCode, lastBody = resp.StatusCode, b
-		}()
-
-		// Sucesso?
-		if lastCode >= 200 && lastCode < 300 {
-			return lastCode, lastBody, nil
+		if code >= 200 && code < 300 {
+			return code, b, nil
 		}
-
-		// Erro 5xx pode ser transitório → retry
-		if lastCode >= 500 && lastCode <= 599 && try <= c.maxRetries {
+		// 5xx → tentar de novo
+		if code >= 500 && code <= 599 && try <= c.maxRetries {
 			time.Sleep(c.backoff * time.Duration(try))
 			continue
 		}
-
-		// Erro 4xx ou excedeu retries
-		return lastCode, lastBody, nil
+		return code, b, nil
 	}
 }
 
@@ -127,15 +145,13 @@ func isRetryableNetErr(err error) bool {
 	}
 	var nerr net.Error
 	if errors.As(err, &nerr) {
-		// timeout/temporary
 		return nerr.Timeout() || nerr.Temporary()
 	}
-	// conexões resetadas/encerradas
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "unexpected eof")
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "unexpected eof")
 }
 
 func onlyDigits(s string) string {
@@ -159,79 +175,125 @@ func makeChatID(jidOrNumber string) (number string, chatID string) {
 
 // ----------------- sending (TEXTO) -----------------
 
-// SendText envia uma mensagem de texto simples no WhatsApp (sem delay).
-// Mantido por compatibilidade.
+// lista de paths prováveis (ordem por “mais comum” primeiro)
+var textPaths = []string{
+	"/send/text",
+	"/api/send/text",
+	"/send-text",
+	"/api/send-text",
+	"/message/text",
+	"/api/message/text",
+	"/messages/text",
+	"/api/messages/text",
+}
+
+// SendText: compat, sem delay
 func (c *Client) SendText(ctx context.Context, number, text string) error {
 	return c.SendTextWithDelay(ctx, number, text, 0)
 }
 
-// SendTextWithDelay envia uma mensagem de texto com suporte ao campo "delay".
-// Durante o delay (em ms), o WhatsApp exibirá “Digitando...”.
+// SendTextWithDelay: envia texto com suporte a "delay" (ms). Durante o delay o WhatsApp exibe “Digitando…”.
 func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string, delayMs int) error {
 	number, chatID := makeChatID(jidOrNumber)
 
+	// muitas instâncias só “mostram” se houver alguns campos padrão
 	body := map[string]any{
-		"number": number,
-		"text":   text,
-		// Algumas instâncias ainda exigem chatId no payload:
-		"chatId": chatID,
-		"chatid": chatID,
+		"number":      number,
+		"text":        text,
+		"chatId":      chatID,
+		"chatid":      chatID,
+		"readchat":    true,
+		"linkPreview": false,
 	}
+
+	// impõe mínimo de 1000ms para garantir visibilidade
 	if delayMs > 0 {
+		if delayMs < 1000 {
+			delayMs = 1000
+		}
 		body["delay"] = delayMs
 	}
 
-	code, b, err := c.doJSON(ctx, c.baseSend+"/send/text", c.tokenSend, body)
-	if err != nil {
-		return err
+	// tenta em cascata várias rotas
+	var lastCode int
+	var lastBody []byte
+	var lastErr error
+
+	for _, p := range textPaths {
+		url := joinURL(c.baseSend, p)
+		code, b, err := c.doJSONWithRetry(ctx, url, c.tokenSend, body)
+		if err == nil && code >= 200 && code < 300 {
+			return nil
+		}
+		lastCode, lastBody, lastErr = code, b, err
 	}
-	if code > 299 {
-		return fmt.Errorf("uazapi send text %d: %s", code, string(b))
+
+	if lastErr != nil {
+		return lastErr
 	}
-	return nil
+	return fmt.Errorf("uazapi send text %d: %s", lastCode, string(lastBody))
 }
 
 // ----------------- sending (MÍDIA) -----------------
 
-// SendMedia envia um arquivo de mídia (imagem, vídeo, áudio) em base64, sem delay.
+var mediaPaths = []string{
+	"/send/media",
+	"/api/send/media",
+	"/send-media",
+	"/api/send-media",
+	"/message/media",
+	"/api/message/media",
+	"/messages/media",
+	"/api/messages/media",
+}
+
 func (c *Client) SendMedia(ctx context.Context, number string, mediaType string, data []byte) error {
 	return c.SendMediaWithDelay(ctx, number, mediaType, data, 0)
 }
 
-// SendMediaWithDelay envia mídia com suporte opcional a "delay" no payload.
-// Observação: a maioria das instâncias aceita "delay" também em /send/media.
-// Se a sua não aceitar, o servidor apenas ignorará o campo.
 func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaType string, data []byte, delayMs int) error {
 	enc := base64.StdEncoding.EncodeToString(data)
 	body := map[string]any{
-		"number": number,
-		"type":   mediaType,
-		"file":   enc,
+		"number":      onlyDigits(number),
+		"type":        mediaType,
+		"file":        enc,
+		"readchat":    true,
+		"linkPreview": false,
 	}
 	if delayMs > 0 {
+		if delayMs < 1000 {
+			delayMs = 1000
+		}
 		body["delay"] = delayMs
 	}
 
-	code, b, err := c.doJSON(ctx, c.baseSend+"/send/media", c.tokenSend, body)
-	if err != nil {
-		return err
+	var lastCode int
+	var lastBody []byte
+	var lastErr error
+	for _, p := range mediaPaths {
+		url := joinURL(c.baseSend, p)
+		code, b, err := c.doJSONWithRetry(ctx, url, c.tokenSend, body)
+		if err == nil && code >= 200 && code < 300 {
+			return nil
+		}
+		lastCode, lastBody, lastErr = code, b, err
 	}
-	if code > 299 {
-		return fmt.Errorf("uazapi send media %d: %s", code, string(b))
+	if lastErr != nil {
+		return lastErr
 	}
-	return nil
+	return fmt.Errorf("uazapi send media %d: %s", lastCode, string(lastBody))
 }
 
 // ----------------- download -----------------
 
-// DownloadByMessageID baixa o conteúdo de uma mensagem via ID.
 func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]byte, string, error) {
 	body := map[string]any{
 		"id":          messageID,
 		"return_link": true,
 	}
+	url := joinURL(c.baseDownload, "/message/download")
 
-	code, b, err := c.doJSON(ctx, c.baseDownload+"/message/download", c.tokenDown, body)
+	code, b, err := c.doJSONWithRetry(ctx, url, c.tokenDown, body)
 	if err != nil {
 		return nil, "", err
 	}
@@ -267,33 +329,14 @@ func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]b
 
 // ----------------- helpers “After” -----------------
 
-// WaitHumanlike aguarda a duração 'd'. Se typing=true, use a própria API com delay no envio real.
-// (Mantido por compatibilidade; prefira chamar diretamente SendTextWithDelay com o delay desejado.)
-func (c *Client) WaitHumanlike(ctx context.Context, _ string, d time.Duration, _ bool) {
-	if d <= 0 {
-		return
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
-}
-
-// SendTextAfter agenda um envio de texto com atraso local (utilize delay no payload quando possível).
+// Espera localmente e então envia texto já com delay server-side (garante “Digitando...”).
 func (c *Client) SendTextAfter(ctx context.Context, jidOrNumber, text string, d time.Duration, _ bool) error {
-	if d > 0 {
-		c.WaitHumanlike(ctx, jidOrNumber, d, false)
-	}
-	// Melhor abordagem: enviar já com delay (server-side typing)
-	return c.SendTextWithDelay(ctx, jidOrNumber, text, int(d.Milliseconds()))
+	// melhor prática: enviar o delay no próprio payload
+	delayMs := int(d / time.Millisecond)
+	return c.SendTextWithDelay(ctx, jidOrNumber, text, delayMs)
 }
 
-// SendMediaAfter agenda um envio de mídia com atraso local.
 func (c *Client) SendMediaAfter(ctx context.Context, jidOrNumber string, mediaType string, data []byte, d time.Duration, _ bool) error {
-	if d > 0 {
-		c.WaitHumanlike(ctx, jidOrNumber, d, false)
-	}
-	return c.SendMediaWithDelay(ctx, onlyDigits(jidOrNumber), mediaType, data, int(d.Milliseconds()))
+	delayMs := int(d / time.Millisecond)
+	return c.SendMediaWithDelay(ctx, onlyDigits(jidOrNumber), mediaType, data, delayMs)
 }
