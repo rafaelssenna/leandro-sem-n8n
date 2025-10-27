@@ -18,11 +18,10 @@ import (
 /*
 Cliente Uazapi compatível com POST /send/text.
 
-- NÃO usa /wait.
-- Suporta payload mínimo exatamente como seu exemplo:
+- NUNCA usa /wait (nem opcional).
+- Suporta payload mínimo exatamente como:
     { "number": "...", "text": "...", "delay": "1000" }
   via WithMinimalPayload(true) + WithDelayAsString(true).
-- Caso não use o modo mínimo, envia payload completo de compatibilidade.
 - Headers: token + convert:true.
 */
 
@@ -33,14 +32,14 @@ type Client struct {
 	tokenDown    string
 	http         *http.Client
 
-	maxRetries     int
-	backoff        time.Duration
-	logReq         bool
-	minVisibleMs   int // força delay mínimo visível
+	maxRetries   int
+	backoff      time.Duration
+	logReq       bool
+	minVisibleMs int // p/ visibilidade (default 1000)
 
-	// controles de payload
+	// controles do formato do payload
 	minimalPayload bool // se true, envia só number/text/delay
-	delayAsString  bool // se true, envia delay como string
+	delayAsString  bool // se true, "delay" vai como string
 }
 
 func New(baseSend, tokenSend, baseDownload, tokenDown string) *Client {
@@ -56,55 +55,28 @@ func New(baseSend, tokenSend, baseDownload, tokenDown string) *Client {
 	}
 }
 
-func (c *Client) WithHTTPClient(h *http.Client) *Client {
-	if h != nil {
-		c.http = h
-	}
-	return c
-}
+func (c *Client) WithHTTPClient(h *http.Client) *Client { if h != nil { c.http = h }; return c }
 func (c *Client) WithRetry(maxRetries int, backoff time.Duration) *Client {
-	if maxRetries >= 0 {
-		c.maxRetries = maxRetries
-	}
-	if backoff > 0 {
-		c.backoff = backoff
-	}
+	if maxRetries >= 0 { c.maxRetries = maxRetries }
+	if backoff > 0 { c.backoff = backoff }
 	return c
 }
-func (c *Client) WithLogging(enabled bool) *Client {
-	c.logReq = enabled
-	return c
-}
-func (c *Client) WithMinVisibleDelay(ms int) *Client {
-	if ms > 0 {
-		c.minVisibleMs = ms
-	}
-	return c
-}
+func (c *Client) WithLogging(enabled bool) *Client { c.logReq = enabled; return c }
+func (c *Client) WithMinVisibleDelay(ms int) *Client { if ms > 0 { c.minVisibleMs = ms }; return c }
 
-// ---- novos toggles para bater no formato exato do seu payload ----
-func (c *Client) WithMinimalPayload(enabled bool) *Client {
-	c.minimalPayload = enabled
-	return c
-}
-func (c *Client) WithDelayAsString(enabled bool) *Client {
-	c.delayAsString = enabled
-	return c
-}
+// === toggles p/ bater no formato exato do payload ===
+func (c *Client) WithMinimalPayload(enabled bool) *Client { c.minimalPayload = enabled; return c }
+func (c *Client) WithDelayAsString(enabled bool) *Client  { c.delayAsString = enabled; return c }
 
-// ----------------- helpers HTTP -----------------
+// ----------------- HTTP helpers -----------------
 
 func joinURL(base, path string) string {
 	b := strings.TrimRight(base, "/")
 	p := path
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
+	if !strings.HasPrefix(p, "/") { p = "/" + p }
 	if strings.HasSuffix(b, "/api") && strings.HasPrefix(p, "/api/") {
 		p = strings.TrimPrefix(p, "/api")
-		if !strings.HasPrefix(p, "/") {
-			p = "/" + p
-		}
+		if !strings.HasPrefix(p, "/") { p = "/" + p }
 	}
 	return b + p
 }
@@ -134,7 +106,6 @@ func (c *Client) doJSONWithRetry(ctx context.Context, url string, token string, 
 	var lastCode int
 	var lastBody []byte
 	var lastErr error
-
 	for try := 1; ; try++ {
 		code, b, err := c.doJSONOnce(ctx, url, token, body)
 		if err != nil {
@@ -146,9 +117,7 @@ func (c *Client) doJSONWithRetry(ctx context.Context, url string, token string, 
 			return 0, nil, err
 		}
 		lastCode, lastBody = code, b
-		if code >= 200 && code < 300 {
-			return code, b, nil
-		}
+		if code >= 200 && code < 300 { return code, b, nil }
 		if code >= 500 && code <= 599 && try <= c.maxRetries {
 			time.Sleep(c.backoff * time.Duration(try))
 			continue
@@ -158,13 +127,9 @@ func (c *Client) doJSONWithRetry(ctx context.Context, url string, token string, 
 }
 
 func isRetryableNetErr(err error) bool {
-	if err == nil {
-		return false
-	}
+	if err == nil { return false }
 	var nerr net.Error
-	if errors.As(err, &nerr) {
-		return nerr.Timeout() || nerr.Temporary()
-	}
+	if errors.As(err, &nerr) { return nerr.Timeout() || nerr.Temporary() }
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "connection reset") ||
 		strings.Contains(s, "connection refused") ||
@@ -174,27 +139,20 @@ func isRetryableNetErr(err error) bool {
 
 func onlyDigits(s string) string {
 	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if ch >= '0' && ch <= '9' {
-			b.WriteByte(ch)
-		}
-	}
+	for i := 0; i < len(s); i++ { ch := s[i]; if ch >= '0' && ch <= '9' { b.WriteByte(ch) } }
 	return b.String()
 }
 
 func makeChatID(jidOrNumber string) (number string, chatID string) {
-	if strings.Contains(jidOrNumber, "@") {
-		return onlyDigits(jidOrNumber), jidOrNumber
-	}
+	if strings.Contains(jidOrNumber, "@") { return onlyDigits(jidOrNumber), jidOrNumber }
 	num := onlyDigits(jidOrNumber)
 	return num, num + "@s.whatsapp.net"
 }
 
-// ----------------- sending (TEXTO) -----------------
+// ----------------- /send/text -----------------
 
 var textPaths = []string{
-	"/send/text", // docs mostram 'send~text', o caminho real é /send/text
+	"/send/text", // caminho HTTP real
 	"/api/send/text",
 	"/send-text",
 	"/api/send-text",
@@ -204,36 +162,32 @@ var textPaths = []string{
 	"/api/messages/text",
 }
 
-// Compat: sem delay
 func (c *Client) SendText(ctx context.Context, number, text string) error {
 	return c.SendTextWithDelay(ctx, number, text, 0)
 }
 
-// Envia texto com delay (ms). NÃO chama /wait.
-// Se minimalPayload=true, envia APENAS number/text/delay (delay em string se delayAsString=true).
+// Gera o payload mínimo se WithMinimalPayload(true) estiver ligado.
+// Se WithDelayAsString(true), envia "delay": "1000".
 func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string, delayMs int) error {
 	numOnly, _ := makeChatID(jidOrNumber)
 	number := onlyDigits(numOnly)
 
 	var body map[string]any
-
 	if c.minimalPayload {
 		body = map[string]any{
 			"number": number,
 			"text":   text,
 		}
 		if delayMs > 0 {
-			if delayMs < c.minVisibleMs {
-				delayMs = c.minVisibleMs
-			}
+			if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
 			if c.delayAsString {
 				body["delay"] = strconv.Itoa(delayMs) // "1000"
 			} else {
-				body["delay"] = delayMs // 1000
+				body["delay"] = delayMs               // 1000
 			}
 		}
 	} else {
-		// payload completo de compat
+		// payload “compatível” (se você quiser manter flags)
 		body = map[string]any{
 			"number":      number,
 			"text":        text,
@@ -243,14 +197,8 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 			"mentions":    "",
 		}
 		if delayMs > 0 {
-			if delayMs < c.minVisibleMs {
-				delayMs = c.minVisibleMs
-			}
+			if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
 			body["delay"] = delayMs
-			body["typing"] = true
-			body["typingTime"] = delayMs
-			body["typing_time"] = delayMs
-			body["showTyping"] = true
 		}
 	}
 
@@ -271,7 +219,7 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 	return fmt.Errorf("uazapi send text %d: %s", lastCode, string(lastBody))
 }
 
-// ----------------- sending (MÍDIA) -----------------
+// ----------------- /send/media -----------------
 
 var mediaPaths = []string{
 	"/send/media",
@@ -293,22 +241,11 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 		"number":      onlyDigits(number),
 		"type":        mediaType,
 		"file":        enc,
-		"readchat":    true,
-		"linkPreview": false,
-		"replyid":     "",
-		"mentions":    "",
 	}
 	if delayMs > 0 {
-		if delayMs < c.minVisibleMs {
-			delayMs = c.minVisibleMs
-		}
+		if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
 		body["delay"] = delayMs
-		body["typing"] = true
-		body["typingTime"] = delayMs
-		body["typing_time"] = delayMs
-		body["showTyping"] = true
 	}
-
 	var lastCode int
 	var lastBody []byte
 	var lastErr error
@@ -329,33 +266,20 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 // ----------------- download -----------------
 
 func (c *Client) DownloadByMessageID(ctx context.Context, messageID string) ([]byte, string, error) {
-	body := map[string]any{
-		"id":          messageID,
-		"return_link": true,
-	}
+	body := map[string]any{ "id": messageID, "return_link": true }
 	url := joinURL(c.baseDownload, "/message/download")
 
 	code, b, err := c.doJSONWithRetry(ctx, url, c.tokenDown, body)
-	if err != nil {
-		return nil, "", err
-	}
-	if code > 299 {
-		return nil, "", fmt.Errorf("uazapi download %d: %s", code, string(b))
-	}
+	if err != nil { return nil, "", err }
+	if code > 299 { return nil, "", fmt.Errorf("uazapi download %d: %s", code, string(b)) }
 
 	var out struct{ FileURL string `json:"fileURL"` }
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, "", err
-	}
-	if out.FileURL == "" {
-		return nil, "", fmt.Errorf("empty fileURL")
-	}
+	if err := json.Unmarshal(b, &out); err != nil { return nil, "", err }
+	if out.FileURL == "" { return nil, "", fmt.Errorf("empty fileURL") }
 
 	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, out.FileURL, nil)
 	resp2, err := c.http.Do(req2)
-	if err != nil {
-		return nil, out.FileURL, err
-	}
+	if err != nil { return nil, out.FileURL, err }
 	defer resp2.Body.Close()
 
 	if resp2.StatusCode > 299 {
