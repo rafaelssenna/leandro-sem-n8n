@@ -1,1 +1,0 @@
-# leandro-sem-n8n
