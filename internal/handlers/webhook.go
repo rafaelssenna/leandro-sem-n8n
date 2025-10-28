@@ -228,7 +228,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Ignora eco do próprio bot
 	if msg.FromMe || msg.WasSentByAPI {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"ok":true,"ignored":"fromMe"}`))
+		_, _ = w.Write([]byte(`{"ok":true,"ignored":"fromMe"}`))
 		return
 	}
 
@@ -270,25 +270,13 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ClientID: client.ID, Role: "user", Type: msgType, Content: textForLLM, ExtID: &msg.MessageID,
 	})
 
-	// "Digitando..." pelo tempo do buffer (não bloqueia)
-	ms := h.cfg.BufferTimeoutSeconds * 1000
-	if ms < 1000 {
-		ms = 1000
-	}
-	if ms > 60000 {
-		ms = 60000
-	}
-	go func() {
-		if err := h.wpp.SendWait(context.Background(), phone, ms); err != nil {
-			log.Println("uazapi wait error:", err)
-		}
-	}()
+	// NÂO chama /wait: usamos apenas delay no envio final (em processCombinedMessage)
 
 	// Enfileira no buffer (agrupamento)
 	h.bufMgr.AddMessage(phone, textForLLM, msgType)
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"ok":true}`))
+	_, _ = w.Write([]byte(`{"ok":true}`))
 }
 
 // processCombinedMessage é acionado no flush do buffer.
@@ -344,11 +332,15 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 	}
 
 	reply, err := h.ai.GetLastAssistantText(ctx, threadID)
-	if err != nil {
-		log.Println("openai get message error:", err)
-		return
-	}
+		if err != nil {
+			log.Println("openai get message error:", err)
+			return
+		}
 	reply = removeRefs(reply)
+
+	// Calcula delay de resposta conforme as configurações
+	delay := h.cfg.ReplyDelay()          // retorna um time.Duration entre min e max
+	delayMs := int(delay / time.Millisecond) // converte para milissegundos
 
 	if strings.ToLower(strings.TrimSpace(lastKind)) == "audio" {
 		audioBytes, err := h.ai.GenerateSpeech(ctx, reply)
@@ -359,14 +351,16 @@ func (h *webhookHandler) processCombinedMessage(ctx context.Context, phone strin
 		_ = models.InsertMessage(ctx, h.pool, models.Message{
 			ClientID: client.ID, Role: "assistant", Type: "audio", Content: reply,
 		})
-		if err := h.wpp.SendMedia(ctx, phone, "audio", audioBytes); err != nil {
+		// Envia áudio com delay
+		if err := h.wpp.SendMediaWithDelay(ctx, phone, "audio", audioBytes, delayMs); err != nil {
 			log.Println("uazapi send audio error:", err)
 		}
 	} else {
 		_ = models.InsertMessage(ctx, h.pool, models.Message{
 			ClientID: client.ID, Role: "assistant", Type: "text", Content: reply,
 		})
-		if err := h.wpp.SendText(ctx, phone, reply); err != nil {
+		// Envia texto com delay
+		if err := h.wpp.SendTextWithDelay(ctx, phone, reply, delayMs); err != nil {
 			log.Println("uazapi send text error:", err)
 		}
 	}
