@@ -20,8 +20,9 @@ Cliente Uazapi compatível com POST /send/text.
 
 - NUNCA usa /wait (nem opcional).
 - Suporta payload mínimo exatamente como:
+    { "number": "...", "text": "...", "delay": 1000 }  // integer (recomendado pela doc)
+  ou, se habilitado, "delay" como string:
     { "number": "...", "text": "...", "delay": "1000" }
-  via WithMinimalPayload(true) + WithDelayAsString(true).
 - Headers: token + convert:true.
 */
 
@@ -35,9 +36,9 @@ type Client struct {
 	maxRetries   int
 	backoff      time.Duration
 	logReq       bool
-	minVisibleMs int // p/ visibilidade (default 1000)
+	minVisibleMs int // mínimo p/ visibilidade
 
-	// controles do formato do payload
+	// formato do payload
 	minimalPayload bool // se true, envia só number/text/delay
 	delayAsString  bool // se true, "delay" vai como string
 }
@@ -63,8 +64,6 @@ func (c *Client) WithRetry(maxRetries int, backoff time.Duration) *Client {
 }
 func (c *Client) WithLogging(enabled bool) *Client { c.logReq = enabled; return c }
 func (c *Client) WithMinVisibleDelay(ms int) *Client { if ms > 0 { c.minVisibleMs = ms }; return c }
-
-// === toggles p/ bater no formato exato do payload ===
 func (c *Client) WithMinimalPayload(enabled bool) *Client { c.minimalPayload = enabled; return c }
 func (c *Client) WithDelayAsString(enabled bool) *Client  { c.delayAsString = enabled; return c }
 
@@ -94,9 +93,7 @@ func (c *Client) doJSONOnce(ctx context.Context, url string, token string, body 
 	}
 
 	resp, err := c.http.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
+	if err != nil { return 0, nil, err }
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, b, nil
@@ -139,14 +136,11 @@ func isRetryableNetErr(err error) bool {
 
 func onlyDigits(s string) string {
 	var b strings.Builder
-	for i := 0; i < len(s); i++ { ch := s[i]; if ch >= '0' && ch <= '9' { b.WriteByte(ch) } }
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch >= '0' && ch <= '9' { b.WriteByte(ch) }
+	}
 	return b.String()
-}
-
-func makeChatID(jidOrNumber string) (number string, chatID string) {
-	if strings.Contains(jidOrNumber, "@") { return onlyDigits(jidOrNumber), jidOrNumber }
-	num := onlyDigits(jidOrNumber)
-	return num, num + "@s.whatsapp.net"
 }
 
 // ----------------- /send/text -----------------
@@ -166,11 +160,10 @@ func (c *Client) SendText(ctx context.Context, number, text string) error {
 	return c.SendTextWithDelay(ctx, number, text, 0)
 }
 
-// Gera o payload mínimo se WithMinimalPayload(true) estiver ligado.
-// Se WithDelayAsString(true), envia "delay": "1000".
+// Gera payload mínimo se WithMinimalPayload(true) estiver ligado.
+// Se WithDelayAsString(true), envia "delay":"1000"; senão, delay:1000 (integer — recomendado).
 func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string, delayMs int) error {
-	numOnly, _ := makeChatID(jidOrNumber)
-	number := onlyDigits(numOnly)
+	number := onlyDigits(jidOrNumber)
 
 	var body map[string]any
 	if c.minimalPayload {
@@ -187,7 +180,6 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 			}
 		}
 	} else {
-		// payload “compatível”
 		body = map[string]any{
 			"number":      number,
 			"text":        text,
@@ -208,14 +200,10 @@ func (c *Client) SendTextWithDelay(ctx context.Context, jidOrNumber, text string
 	for _, p := range textPaths {
 		url := joinURL(c.baseSend, p)
 		code, b, err := c.doJSONWithRetry(ctx, url, c.tokenSend, body)
-		if err == nil && code >= 200 && code < 300 {
-			return nil
-		}
+		if err == nil && code >= 200 && code < 300 { return nil }
 		lastCode, lastBody, lastErr = code, b, err
 	}
-	if lastErr != nil {
-		return lastErr
-	}
+	if lastErr != nil { return lastErr }
 	return fmt.Errorf("uazapi send text %d: %s", lastCode, string(lastBody))
 }
 
@@ -238,9 +226,9 @@ func (c *Client) SendMedia(ctx context.Context, number string, mediaType string,
 func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaType string, data []byte, delayMs int) error {
 	enc := base64.StdEncoding.EncodeToString(data)
 	body := map[string]any{
-		"number":      onlyDigits(number),
-		"type":        mediaType,
-		"file":        enc,
+		"number": onlyDigits(number),
+		"type":   mediaType,
+		"file":   enc,
 	}
 	if delayMs > 0 {
 		if delayMs < c.minVisibleMs { delayMs = c.minVisibleMs }
@@ -252,14 +240,10 @@ func (c *Client) SendMediaWithDelay(ctx context.Context, number string, mediaTyp
 	for _, p := range mediaPaths {
 		url := joinURL(c.baseSend, p)
 		code, b, err := c.doJSONWithRetry(ctx, url, c.tokenSend, body)
-		if err == nil && code >= 200 && code < 300 {
-			return nil
-		}
+		if err == nil && code >= 200 && code < 300 { return nil }
 		lastCode, lastBody, lastErr = code, b, err
 	}
-	if lastErr != nil {
-		return lastErr
-	}
+	if lastErr != nil { return lastErr }
 	return fmt.Errorf("uazapi send media %d: %s", lastCode, string(lastBody))
 }
 
