@@ -12,7 +12,6 @@ import (
 	"github.com/your-org/leandro-agent/internal/db"
 	"github.com/your-org/leandro-agent/internal/handlers"
 
-	// ajuste o import do pacote conforme a sua árvore:
 	"github.com/your-org/leandro-agent/internal/uazapi"
 )
 
@@ -35,21 +34,23 @@ func getenvBool(key string, def bool) bool {
 	}
 }
 
-// Cria o cliente Uazapi a partir das ENVs e liga o modo de payload mínimo
-// + delay como STRING para gerar exatamente {"number","text","delay":"1000"}.
+// Cria o cliente Uazapi a partir das ENVs.
 func newUazapiFromEnv() *uazapi.Client {
 	baseSend := getenv("UAZAPI_BASE_SEND", "")
-	tokSend := getenv("UAZAPI_TOKEN_SEND", "")
+	tokSend  := getenv("UAZAPI_TOKEN_SEND", "")
 	baseDown := getenv("UAZAPI_BASE_DOWNLOAD", baseSend)
-	tokDown := getenv("UAZAPI_TOKEN_DOWNLOAD", tokSend)
+	tokDown  := getenv("UAZAPI_TOKEN_DOWNLOAD", tokSend)
 
-	// flags para forçar o payload mínimo e delay como string
+	if baseSend == "" || tokSend == "" {
+		log.Fatal("UAZAPI_BASE_SEND e UAZAPI_TOKEN_SEND são obrigatórios")
+	}
+
 	minimalPayload := getenvBool("UAZAPI_MINIMAL_PAYLOAD", true)
-	delayAsString := getenvBool("UAZAPI_DELAY_AS_STRING", true)
+	delayAsString  := getenvBool("UAZAPI_DELAY_AS_STRING", false) // doc recomenda integer
 
 	cli := uazapi.New(baseSend, tokSend, baseDown, tokDown).
-		WithLogging(true).          // logs simples da chamada HTTP (opcional)
-		WithMinVisibleDelay(1000) // garante delay >= 1000ms quando informado
+		WithLogging(true).
+		WithMinVisibleDelay(1000)
 
 	if minimalPayload {
 		cli = cli.WithMinimalPayload(true)
@@ -58,42 +59,37 @@ func newUazapiFromEnv() *uazapi.Client {
 		cli = cli.WithDelayAsString(true)
 	}
 
-	// IMPORTANTE: nada de /wait neste cliente (versão NO-WAIT no pacote uazapi)
 	return cli
 }
 
-// main is the entrypoint for the WhatsApp assistant server.
 func main() {
 	cfg := config.Load()
 
-	// Connect to Postgres
+	// DB
 	pool, err := db.Connect(cfg.DatabaseURL)
-	if err != nil {
-		log.Fatalf("db connect error: %v", err)
-	}
+	if err != nil { log.Fatalf("db connect error: %v", err) }
 	defer pool.Close()
 
-	// Auto-migrate (creates tables if they don't exist)
 	if err := db.AutoMigrate(context.Background(), pool); err != nil {
 		log.Fatalf("db migrate error: %v", err)
 	}
 
-	// Instancia o cliente Uazapi com o formato de payload exigido
+	// Uazapi client (NO-WAIT)
 	uaz := newUazapiFromEnv()
 
 	mux := http.NewServeMux()
 
-	// Health check
+	// health
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Webhook para WhatsApp.
-	// Se o seu handler já aceitar o client, use ESTA linha:
+	// Webhook:
+	// RECOMENDADO: injete o client no handler (crie esse construtor no pacote handlers)
 	// mux.Handle("/webhook/Leandro-JW", handlers.NewWebhookHandlerWithUazapi(cfg, pool, uaz))
 
-	// Caso seu handler ainda tenha a assinatura antiga, mantenha esta linha:
+	// Enquanto não tiver o construtor acima, mantém o antigo:
 	mux.Handle("/webhook/Leandro-JW", handlers.NewWebhookHandler(cfg, pool))
 
 	srv := &http.Server{
@@ -108,5 +104,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	_ = uaz // evita “declared and not used” caso você ainda não injete no handler
+	_ = uaz // evita "declared and not used" enquanto não injeta no handler
 }
